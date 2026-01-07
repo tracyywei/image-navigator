@@ -2,10 +2,16 @@
   "manifest_version": 3,
   "name": "Image Rotor",
   "version": "1.0.0",
-  "description": "Explore images through structured, screen-reader-first navigation with multiple lenses (Objects, Layout, Style)",
+  "description": "AI-powered image navigation for BLV users with dynamic lenses, predictive ordering, and confidence-aware descriptions",
   "permissions": [
     "activeTab",
-    "contextMenus"
+    "contextMenus",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://localhost:3001/*",
+    "http://127.0.0.1:3001/*"
   ],
   "action": {
     "default_icon": {
