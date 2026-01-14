@@ -11,6 +11,21 @@ chrome.runtime.onInstalled.addListener(() => {
   });
 });
 
+// Handle keyboard shortcuts
+chrome.commands.onCommand.addListener((command) => {
+  chrome.tabs.query({active: true, currentWindow: true}, (tabs) => {
+    if (!tabs[0]) return;
+    
+    if (command === 'open-image-navigator') {
+      chrome.tabs.sendMessage(tabs[0].id, {action: 'startImageNavigation'});
+    } else if (command === 'increase-voice-speed') {
+      chrome.tabs.sendMessage(tabs[0].id, {action: 'increaseVoiceSpeed'});
+    } else if (command === 'decrease-voice-speed') {
+      chrome.tabs.sendMessage(tabs[0].id, {action: 'decreaseVoiceSpeed'});
+    }
+  });
+});
+
 // Handle API requests from content script (bypasses CORS)
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'describeImage') {

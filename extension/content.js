@@ -30,7 +30,13 @@
   
   // Drill-down navigation state
   let drillDownStack = []; // Stack of {item, parentItems, focusedIndex} for navigation history
-  let isDrilledDown = false; // Whether we're currently viewing sub-items
+    let isDrilledDown = false; // Whether we're currently viewing sub-items
+  
+  // Image navigation state
+  let imageNavigationMode = false;
+  let pageImages = [];
+  let focusedImageIndex = -1;
+  let imageHighlightOverlay = null;
 
   // Lens configuration - will be populated dynamically from API response
   let lensOrder = [];
@@ -50,6 +56,52 @@
       this.lastSpokenTime = 0;
       this.sameTextThreshold = 1000;
       this.enabled = true;
+      this.rate = 1.0; // Default speed (1.0 = normal, can go up to 2.0)
+      this.loadSpeed();
+    }
+
+    async loadSpeed() {
+      try {
+        if (typeof chrome !== 'undefined' && chrome.storage) {
+          const result = await chrome.storage.local.get(['ttsSpeed']);
+          if (result.ttsSpeed !== undefined) {
+            this.rate = Math.max(0.5, Math.min(2.0, parseFloat(result.ttsSpeed) || 1.0));
+          }
+        } else {
+          const stored = localStorage.getItem('imageRotor_ttsSpeed');
+          if (stored) {
+            this.rate = Math.max(0.5, Math.min(2.0, parseFloat(stored) || 1.0));
+          }
+        }
+      } catch (error) {
+        console.warn('[TTS Manager] Failed to load speed:', error);
+      }
+    }
+
+    async setSpeed(rate) {
+      this.rate = Math.max(0.5, Math.min(2.0, parseFloat(rate) || 1.0));
+      try {
+        if (typeof chrome !== 'undefined' && chrome.storage) {
+          await chrome.storage.local.set({ ttsSpeed: this.rate });
+        } else {
+          localStorage.setItem('imageRotor_ttsSpeed', String(this.rate));
+        }
+        updateSpeedIndicator(this.rate);
+      } catch (error) {
+        console.warn('[TTS Manager] Failed to save speed:', error);
+      }
+    }
+
+    increaseSpeed() {
+      const newRate = Math.min(2.0, this.rate + 0.25);
+      this.setSpeed(newRate);
+      announce(`Voice speed ${(newRate * 100).toFixed(0)}%`);
+    }
+
+    decreaseSpeed() {
+      const newRate = Math.max(0.5, this.rate - 0.25);
+      this.setSpeed(newRate);
+      announce(`Voice speed ${(newRate * 100).toFixed(0)}%`);
     }
 
     setEnabled(enabled) {
@@ -80,7 +132,7 @@
         }
 
         const utterance = new SpeechSynthesisUtterance(text);
-        utterance.rate = 0.95;
+        utterance.rate = this.rate; // Use configurable speed
         utterance.pitch = 1;
         utterance.volume = 1;
 
@@ -630,6 +682,18 @@
     }
   }
 
+  function updateSpeedIndicator(rate) {
+    const speedBtn = document.querySelector('.ir-speed-btn');
+    const speedIndicator = document.querySelector('.ir-speed-indicator');
+    if (speedBtn) {
+      speedBtn.setAttribute('title', `Voice speed: ${(rate * 100).toFixed(0)}%`);
+      speedBtn.setAttribute('aria-label', `Voice speed: ${(rate * 100).toFixed(0)}%`);
+    }
+    if (speedIndicator) {
+      speedIndicator.textContent = `${rate.toFixed(1)}x`;
+    }
+  }
+
   function updateLoadingState(loading) {
     if (!rotorPanel) return;
     
@@ -646,7 +710,16 @@
 
   // Create the rotor panel UI
   async function createRotorPanel(img) {
+    if (!img) {
+      console.error('[Image Rotor] createRotorPanel called with undefined/null image');
+      return;
+    }
     const imageUrl = img.src || (img.isVirtual ? img.src : null);
+    if (!imageUrl) {
+      console.error('[Image Rotor] Image has no src property:', img);
+      announce('Cannot analyze image: no image source available');
+      return;
+    }
     console.log('[Image Rotor] createRotorPanel called for image:', imageUrl?.substring(0, 100));
     removeRotorPanel();
     currentImage = img;
@@ -677,6 +750,13 @@
               </svg>
               <span class="ir-speaking-indicator"></span>
             </button>
+            <button class="ir-btn ir-btn-icon ir-speed-btn" aria-label="Voice speed" title="Voice speed: 100%">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"></circle>
+                <path d="M12 6v6l4 2"></path>
+              </svg>
+              <span class="ir-speed-indicator">1.0x</span>
+            </button>
             <button class="ir-btn ir-btn-icon ir-close-btn" aria-label="Close Image Rotor">
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <line x1="18" y1="6" x2="6" y2="18"></line>
@@ -694,6 +774,8 @@
             <kbd>Enter</kbd> Select / Drill down
             <span class="ir-hint-sep">·</span>
             <kbd>Backspace</kbd> Drill up
+            <span class="ir-hint-sep">·</span>
+            <kbd>+</kbd><kbd>-</kbd> Speed
             <span class="ir-hint-sep">·</span>
             <kbd>Esc</kbd> Close
           </div>
@@ -1062,7 +1144,7 @@
     
     // Lens label speech: Only speak once per lens switch (context anchor)
     if (lastLensSpoken !== currentLens) {
-      const lensAnnouncement = `${lensName} lens`;
+      const lensAnnouncement = `${lensName}`;
       announce(lensAnnouncement);
       ttsManager.speak(lensAnnouncement, { interrupt: true, debounceMs: 0 });
       lastLensSpoken = currentLens;
@@ -1140,13 +1222,272 @@
   }
 
   function announce(message) {
-    if (!rotorPanel) return;
-    const liveRegion = rotorPanel.querySelector('.ir-live-region');
+    // Create live region if it doesn't exist (for announcements outside rotor panel)
+    let liveRegion = rotorPanel?.querySelector('.ir-live-region');
+    if (!liveRegion) {
+      liveRegion = document.querySelector('.ir-global-live-region');
+      if (!liveRegion) {
+        liveRegion = document.createElement('div');
+        liveRegion.className = 'ir-global-live-region';
+        liveRegion.setAttribute('aria-live', 'polite');
+        liveRegion.setAttribute('aria-atomic', 'true');
+        liveRegion.style.cssText = 'position: absolute; left: -10000px; width: 1px; height: 1px; overflow: hidden;';
+        document.body.appendChild(liveRegion);
+      }
+    }
     if (liveRegion) {
     liveRegion.textContent = message;
     }
   }
 
+
+  function playBoundarySound() {
+    try {
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const oscillator = audioContext.createOscillator();
+      const gainNode = audioContext.createGain();
+      
+      oscillator.connect(gainNode);
+      gainNode.connect(audioContext.destination);
+      
+      oscillator.frequency.value = 800;
+      oscillator.type = 'sine';
+      
+      gainNode.gain.setValueAtTime(0.1, audioContext.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.1);
+      
+      oscillator.start(audioContext.currentTime);
+      oscillator.stop(audioContext.currentTime + 0.1);
+    } catch (error) {
+      console.warn('Could not play boundary sound:', error);
+    }
+  }
+  
+  // Start keyboard-based image navigation mode
+  function startImageNavigation() {
+    // Find all images on the page
+    pageImages = Array.from(document.querySelectorAll('img')).filter(img => {
+      // Filter out very small images (likely icons/decorative)
+      // Also ensure image is still in DOM and has valid src
+      if (!img || !document.contains(img) || !img.src) return false;
+      const rect = img.getBoundingClientRect();
+      return rect.width > 50 && rect.height > 50 && !img.src.startsWith('data:');
+    });
+
+    if (pageImages.length === 0) {
+      announce('No images found on this page');
+      return;
+    }
+
+    imageNavigationMode = true;
+    focusedImageIndex = 0;
+    
+    // Create highlight overlay if it doesn't exist
+    if (!imageHighlightOverlay) {
+      imageHighlightOverlay = document.createElement('div');
+      imageHighlightOverlay.className = 'ir-image-highlight';
+      imageHighlightOverlay.setAttribute('role', 'status');
+      imageHighlightOverlay.setAttribute('aria-live', 'polite');
+      document.body.appendChild(imageHighlightOverlay);
+    }
+
+    // Show hint
+    showImageNavigationHint();
+    
+    // Focus first image
+    focusImage(0);
+    
+    // Add keyboard listener for image navigation
+    document.addEventListener('keydown', handleImageNavigationKeys, true);
+    
+    announce(`Image navigation mode. ${pageImages.length} images found. Use arrow keys to navigate, Enter to analyze, Escape to exit.`);
+  }
+  
+  function showImageNavigationHint() {
+    // Remove existing hint if any
+    const existingHint = document.querySelector('.ir-image-nav-hint');
+    if (existingHint) existingHint.remove();
+
+    const hint = document.createElement('div');
+    hint.className = 'ir-image-nav-hint';
+    hint.style.cssText = `
+      position: fixed;
+      top: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #141416;
+      color: #fafafa;
+      padding: 12px 24px;
+      border-radius: 8px;
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 14px;
+      z-index: 2147483647;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+      border: 1px solid #27272a;
+    `;
+    hint.textContent = `Image Navigator: ${pageImages.length} images. Arrow keys to navigate, Enter to analyze, Esc to exit`;
+    document.body.appendChild(hint);
+    
+    // Auto-hide after 3 seconds
+    setTimeout(() => {
+      if (hint.parentNode) {
+        hint.style.opacity = '0';
+        hint.style.transition = 'opacity 0.3s';
+        setTimeout(() => hint.remove(), 300);
+      }
+    }, 3000);
+  }
+  
+  function focusImage(index) {
+    if (index < 0 || index >= pageImages.length) {
+      playBoundarySound();
+      return;
+    }
+
+    focusedImageIndex = index;
+    const img = pageImages[index];
+    
+    if (!img || !document.contains(img)) {
+      // Image was removed from DOM, remove from our list
+      pageImages = pageImages.filter((_, i) => i !== index);
+      if (pageImages.length === 0) {
+        stopImageNavigation();
+        announce('No images remaining on page');
+        return;
+      }
+      // Adjust index if needed
+      if (focusedImageIndex >= pageImages.length) {
+        focusedImageIndex = pageImages.length - 1;
+      }
+      focusImage(focusedImageIndex);
+      return;
+    }
+    
+    // Scroll image into view
+    img.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    
+    // Highlight image
+    const rect = img.getBoundingClientRect();
+    if (imageHighlightOverlay) {
+      imageHighlightOverlay.style.display = 'block';
+      imageHighlightOverlay.style.left = `${rect.left + window.scrollX}px`;
+      imageHighlightOverlay.style.top = `${rect.top + window.scrollY}px`;
+      imageHighlightOverlay.style.width = `${rect.width}px`;
+      imageHighlightOverlay.style.height = `${rect.height}px`;
+    }
+    
+    // Announce image info
+    const altText = img.alt || 'No alt text';
+    const position = `${index + 1} of ${pageImages.length}`;
+    announce(`Image ${position}: ${altText}`);
+  }
+  
+  function stopImageNavigation() {
+    imageNavigationMode = false;
+    focusedImageIndex = -1;
+    
+    if (imageHighlightOverlay) {
+      imageHighlightOverlay.style.display = 'none';
+    }
+    
+    const hint = document.querySelector('.ir-image-nav-hint');
+    if (hint) hint.remove();
+    
+    document.removeEventListener('keydown', handleImageNavigationKeys, true);
+    
+    announce('Image navigation mode exited');
+  }
+  
+  function handleImageNavigationKeys(e) {
+    if (!imageNavigationMode) return;
+    
+    switch (e.key) {
+      case 'ArrowUp':
+      case 'ArrowLeft':
+        e.preventDefault();
+        e.stopPropagation();
+        if (focusedImageIndex > 0) {
+          focusImage(focusedImageIndex - 1);
+        } else {
+          playBoundarySound();
+          announce('First image');
+        }
+        break;
+        
+      case 'ArrowDown':
+      case 'ArrowRight':
+        e.preventDefault();
+        e.stopPropagation();
+        if (focusedImageIndex < pageImages.length - 1) {
+          focusImage(focusedImageIndex + 1);
+        } else {
+          playBoundarySound();
+          announce('Last image');
+        }
+        break;
+        
+      case 'Enter':
+        e.preventDefault();
+        e.stopPropagation();
+        console.log('[Image Rotor] Enter pressed, focusedImageIndex:', focusedImageIndex, 'pageImages.length:', pageImages.length);
+        if (focusedImageIndex >= 0 && focusedImageIndex < pageImages.length) {
+          const imgToAnalyze = pageImages[focusedImageIndex];
+          console.log('[Image Rotor] Image to analyze:', {
+            exists: !!imgToAnalyze,
+            hasSrc: !!(imgToAnalyze && imgToAnalyze.src),
+            inDOM: !!(imgToAnalyze && document.contains(imgToAnalyze)),
+            src: imgToAnalyze ? (imgToAnalyze.src || 'no src') : 'no image'
+          });
+          
+          // Don't stop navigation yet - wait until panel is created
+          
+          if (imgToAnalyze && document.contains(imgToAnalyze)) {
+            // Check if image has src or can get it
+            let imageSrc = imgToAnalyze.src;
+            if (!imageSrc) {
+              // Try to get src from currentSrc or data-src
+              imageSrc = imgToAnalyze.currentSrc || imgToAnalyze.getAttribute('data-src') || imgToAnalyze.getAttribute('srcset')?.split(' ')[0] || '';
+            }
+            
+            if (imageSrc) {
+              console.log('[Image Rotor] Calling createRotorPanel with image:', imageSrc.substring(0, 100));
+              // Ensure image has src before calling
+              if (!imgToAnalyze.src && imageSrc) {
+                imgToAnalyze.src = imageSrc;
+              }
+              
+              // Create panel and then stop navigation
+              createRotorPanel(imgToAnalyze)
+                .then(() => {
+                  console.log('[Image Rotor] Panel created successfully');
+                  stopImageNavigation();
+                })
+                .catch(error => {
+                  console.error('[Image Rotor] Error creating rotor panel:', error);
+                  console.error('[Image Rotor] Error stack:', error.stack);
+                  announce('Error analyzing image: ' + error.message);
+                  stopImageNavigation();
+                });
+            } else {
+              console.error('[Image Rotor] Image has no src property');
+              announce('Cannot analyze image: no image source available');
+              stopImageNavigation();
+            }
+          } else {
+            console.error('[Image Rotor] Image no longer available or not in DOM');
+            announce('Image no longer available');
+            stopImageNavigation();
+          }
+        }
+        break;
+        
+      case 'Escape':
+        e.preventDefault();
+        e.stopPropagation();
+        stopImageNavigation();
+        break;
+    }
+  }
   function attachPanelListeners(panel) {
     // Close button
     const closeBtn = panel.querySelector('.ir-close-btn');
@@ -1163,6 +1504,32 @@
         }
       });
     }
+    
+    // Speed control button - cycles through speeds and increases speed
+    const speedBtn = panel.querySelector('.ir-speed-btn');
+    if (speedBtn) {
+      speedBtn.addEventListener('click', () => {
+        // Increase speed: 1.0x -> 1.25x -> 1.5x -> 1.75x -> 2.0x -> 1.0x (cycle)
+        const currentRate = ttsManager.rate;
+        let newRate;
+        if (currentRate < 1.25) {
+          newRate = 1.25;
+        } else if (currentRate < 1.5) {
+          newRate = 1.5;
+        } else if (currentRate < 1.75) {
+          newRate = 1.75;
+        } else if (currentRate < 2.0) {
+          newRate = 2.0;
+        } else {
+          newRate = 1.0; // Cycle back to normal
+        }
+        ttsManager.setSpeed(newRate);
+        announce(`Voice speed ${(newRate * 100).toFixed(0)}%`);
+      });
+    }
+    
+    // Initialize speed indicator
+    updateSpeedIndicator(ttsManager.rate);
     
     // Detail speak button
     const detailSpeakBtn = panel.querySelector('.ir-detail-speak');
@@ -1216,7 +1583,7 @@
         const lensName = currentLens && lensLabels[currentLens] ? lensLabels[currentLens] : 'Current';
         // Speak lens label once as context anchor
         if (lastLensSpoken !== currentLens) {
-          const lensAnnouncement = `${lensName} lens`;
+          const lensAnnouncement = `${lensName}`;
           announce(lensAnnouncement);
           ttsManager.speak(lensAnnouncement, { interrupt: true, debounceMs: 0 });
           lastLensSpoken = currentLens;
@@ -1253,38 +1620,50 @@
       case 'ArrowUp':
         e.preventDefault();
         if (items.length > 0) {
-          focusedIndex = focusedIndex === 0 ? items.length - 1 : focusedIndex - 1;
-          const item = items[focusedIndex];
-          if (item) {
-            // Navigation = labels only (per requirements)
-            let labelToSpeak = item.label;
-            // Add uncertainty cue only if uncertain
-            if ((item.confidence === 'low' || item.confidence === 'medium') && !labelToSpeak.includes('(likely)')) {
-              labelToSpeak = `${labelToSpeak}. Likely inferred.`;
+          if (focusedIndex > 0) {
+            focusedIndex = focusedIndex - 1;
+            const item = items[focusedIndex];
+            if (item) {
+              // Navigation = labels only (per requirements)
+              let labelToSpeak = item.label;
+              // Add uncertainty cue only if uncertain
+              if ((item.confidence === 'low' || item.confidence === 'medium') && !labelToSpeak.includes('(likely)')) {
+                labelToSpeak = `${labelToSpeak}. Likely inferred.`;
+              }
+              announce(labelToSpeak);
+              ttsManager.speakDebounced(labelToSpeak);
             }
-            announce(labelToSpeak);
-            ttsManager.speakDebounced(labelToSpeak);
-          }
           renderItems();
+          } else {
+            // At first item - play sound to indicate boundary
+            playBoundarySound();
+            announce('First item');
+          }
         }
         break;
         
       case 'ArrowDown':
         e.preventDefault();
         if (items.length > 0) {
-          focusedIndex = focusedIndex === items.length - 1 ? 0 : focusedIndex + 1;
-          const item = items[focusedIndex];
-          if (item) {
-            // Navigation = labels only (per requirements)
-            let labelToSpeak = item.label;
-            // Add uncertainty cue only if uncertain
-            if ((item.confidence === 'low' || item.confidence === 'medium') && !labelToSpeak.includes('(likely)')) {
-              labelToSpeak = `${labelToSpeak}. Likely inferred.`;
+          if (focusedIndex < items.length - 1) {
+            focusedIndex = focusedIndex + 1;
+            const item = items[focusedIndex];
+            if (item) {
+              // Navigation = labels only (per requirements)
+              let labelToSpeak = item.label;
+              // Add uncertainty cue only if uncertain
+              if ((item.confidence === 'low' || item.confidence === 'medium') && !labelToSpeak.includes('(likely)')) {
+                labelToSpeak = `${labelToSpeak}. Likely inferred.`;
+              }
+              announce(labelToSpeak);
+              ttsManager.speakDebounced(labelToSpeak);
             }
-            announce(labelToSpeak);
-            ttsManager.speakDebounced(labelToSpeak);
-          }
           renderItems();
+          } else {
+            // At last item - play sound to indicate boundary
+            playBoundarySound();
+            announce('Last item');
+          }
         }
         break;
         
@@ -1349,6 +1728,22 @@
         if (isDrilledDown) {
           e.preventDefault();
           drillUp();
+        }
+        break;
+        
+      case '+':
+      case '=':
+        if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+          e.preventDefault();
+          ttsManager.increaseSpeed();
+        }
+        break;
+        
+      case '-':
+      case '_':
+        if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+          e.preventDefault();
+          ttsManager.decreaseSpeed();
         }
         break;
     }
@@ -1460,6 +1855,26 @@
     console.log('[Image Rotor] Received message:', message.action);
     try {
     switch (message.action) {
+      case 'startImageNavigation':
+        console.log('[Image Rotor] Starting image navigation mode');
+        startImageNavigation();
+        sendResponse({ success: true });
+        break;
+        
+      case 'increaseVoiceSpeed':
+        if (ttsManager) {
+          ttsManager.increaseSpeed();
+        }
+        sendResponse({ success: true });
+        break;
+        
+      case 'decreaseVoiceSpeed':
+        if (ttsManager) {
+          ttsManager.decreaseSpeed();
+        }
+        sendResponse({ success: true });
+        break;
+        
       case 'toggleImageSelector':
           console.log('[Image Rotor] Toggling image selector');
         if (rotorPanel) {

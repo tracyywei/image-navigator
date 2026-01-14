@@ -28,12 +28,41 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
-      "css": ["styles.css"]
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "styles.css"
+      ]
     }
   ],
   "background": {
     "service_worker": "background.js"
+  },
+  "commands": {
+    "open-image-navigator": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+U",
+        "mac": "Command+Shift+U"
+      },
+      "description": "Open Image Navigator - Navigate and analyze images"
+    },
+    "increase-voice-speed": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Up",
+        "mac": "Command+Shift+Up"
+      },
+      "description": "Increase voice speed"
+    },
+    "decrease-voice-speed": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Down",
+        "mac": "Command+Shift+Down"
+      },
+      "description": "Decrease voice speed"
+    }
   }
 }

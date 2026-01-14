@@ -190,6 +190,23 @@
   position: relative;
 }
 
+.ir-speed-btn {
+  position: relative;
+}
+
+.ir-speed-indicator {
+  position: absolute;
+  bottom: 2px;
+  right: 2px;
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--ir-text);
+  background: var(--ir-bg-card);
+  padding: 1px 3px;
+  border-radius: 2px;
+  line-height: 1;
+}
+
 .ir-speaking-indicator {
   position: absolute;
   top: 2px;
@@ -621,4 +638,33 @@
 .ir-items-list::-webkit-scrollbar-thumb:hover,
 .ir-detail-description::-webkit-scrollbar-thumb:hover {
   background: var(--ir-text-muted);
+}
+
+
+/* Image Navigation Mode Styles */
+.ir-image-highlight {
+  position: absolute;
+  border: 3px solid #3b82f6;
+  border-radius: 4px;
+  pointer-events: none;
+  z-index: 2147483646;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.3), 0 0 20px rgba(59, 130, 246, 0.5);
+  transition: all 0.2s ease;
+}
+
+.ir-image-nav-hint {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #141416;
+  color: #fafafa;
+  padding: 12px 24px;
+  border-radius: 8px;
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  z-index: 2147483647;
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+  border: 1px solid #27272a;
+  pointer-events: none;
 }

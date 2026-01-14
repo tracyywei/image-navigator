@@ -75,75 +75,7 @@ function parseRegionHint(hint) {
   return { x: 35, y: 35, width: 30, height: 30 };
 }
 
-// STAGE 1: PLANNER - Quick classification and lens recommendation
-async function runPlanner(imageContent, context, pageTitle, hostDomain) {
-  const plannerSystemPrompt = `You are an accessibility assistant for BLV users. Classify the image type and decide the best rotor lenses to organize the visual contents directory. Output ONLY valid JSON.`;
-
-  const plannerUserPrompt = `Analyze this image and provide a planning JSON. Think of the rotor as a directory of visual contents - what visual elements are present in this image that should be cataloged?
-
-Context:
-- Page title: ${pageTitle || 'Not available'}
-- Surrounding context: ${context || 'Not available'}
-- Host domain: ${hostDomain || 'Not available'}
-
-Identify VISUAL CONTENTS and organize into DIVERSE, DYNAMIC lenses (4-7 lenses).
-
-STANDARD: Text, Objects, Layout, Data, People, Style
-SPECIALIZED (by image type):
-- Art: "Artwork Details", "Composition", "Technique", "Symbols"
-- Architecture: "Architectural Features", "Structural Elements", "Materials"
-- Nature/Landscape: "Natural Elements", "Terrain", "Weather", "Flora & Fauna"
-- Food: "Food Items", "Presentation", "Ingredients"
-- Portraits: "Facial Features", "Expression", "Pose", "Clothing"
-- Events: "Activities", "Participants", "Setting"
-- Fashion: "Garments", "Accessories", "Styling"
-- Sports: "Action", "Equipment", "Players"
-- Documents: "Sections", "Headings", "Content Blocks"
-- Charts/Data: "Data Points", "Trends", "Labels", "Legend"
-- Screenshots: "UI Elements", "Content", "Navigation"
-- Products: "Product Features", "Packaging", "Branding"
-- Maps: "Locations", "Routes", "Markers", "Regions"
-
-Mix standard and specialized lenses. Be specific (e.g., "Foreground Objects" vs "Background Elements").
-
-Classify imageType: "art", "architecture", "landscape", "portrait", "street", "nature", "food", "event", "interior", "fashion", "sports", "wildlife", "photo", "document", "chart", "screenshot", "meme", "product", "map"
-
-Output JSON with these exact fields (example provided below):
-{
-  "imageType": "document" | "chart" | "screenshot" | "meme" | "product" | "map" | "art" | "architecture" | "landscape" | "portrait" | "street" | "nature" | "food" | "event" | "interior" | "fashion" | "sports" | "wildlife" | "photo" | "unknown",
-  "taskHint": "skim" | "read_text" | "data" | "social" | "general",
-  "hasText": true/false,
-  "recommendedLenses": ["Text", "Layout", "Objects", ...],  // 4-7 lenses, mix standard and specialized, ordered by priority
-  "lensSpecs": {
-    "Text": {"mustInclude": ["title", "labels"], "maxItems": 6},
-    "Layout": {"maxItems": 6},
-    ...
-  },
-  "globalSalienceHeuristics": ["central visual elements first", "text elements before style if present", "prominent visual contents prioritized", ...]
-}`;
-
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    messages: [
-      {
-        role: 'system',
-        content: plannerSystemPrompt
-      },
-      {
-        role: 'user',
-        content: [
-          { type: 'text', text: plannerUserPrompt },
-          imageContent
-        ]
-      }
-    ],
-    max_tokens: 800,
-    temperature: 0.1,
-    response_format: { type: 'json_object' }
-  });
-
-  return JSON.parse(response.choices[0].message.content);
-}
+// PLANNER REMOVED - Generator now handles all analysis in one call for better performance
 
 // Generate alt-text using original prompt
 async function generateAltText(imageContent, context, pageTitle) {
@@ -181,22 +113,35 @@ Now provide the alt-text for this image.`;
   return response.choices[0].message.content.trim();
 }
 
-// STAGE 2: GENERATOR - Full RotorResult generation
-async function runGenerator(imageContent, plannerResult, context, pageTitle) {
+// GENERATOR - Full RotorResult generation (now handles all analysis in one call)
+async function runGenerator(imageContent, context, pageTitle, hostDomain) {
   const generatorSystemPrompt = `You generate a visual contents directory for BLV users. Think of the rotor as a skimmable table of contents listing the actual visual elements present in the image. Each item represents a distinct visual element that can be found in the image. Output ONLY valid JSON that matches the schema exactly.`;
 
-  const generatorUserPrompt = `Generate a complete RotorResult based on this planner output. 
+  const generatorUserPrompt = `Generate a complete RotorResult by analyzing this image. 
 
 IMPORTANT: Think of this rotor as a DIRECTORY OF VISUAL CONTENTS - like a table of contents for what's visually present in the image. Each lens organizes visual elements by type, and each item represents a specific visual element that exists in the image.
 
-The imageType from the planner indicates the specific category (e.g., "art", "architecture", "landscape", "portrait", "street", "nature", "food", "event", "interior", "fashion", "sports", "wildlife", or generic "photo"). Use this to inform what visual elements are most relevant to catalog.
+First, classify the image type: "art", "architecture", "landscape", "portrait", "street", "nature", "food", "event", "interior", "fashion", "sports", "wildlife", "photo", "document", "chart", "screenshot", "meme", "product", "map", or "unknown".
 
-PLANNER OUTPUT:
-${JSON.stringify(plannerResult, null, 2)}
+Based on the image type, organize visual contents into DIVERSE, DYNAMIC lenses (4-7 lenses). Mix standard lenses (Text, Objects, Layout, Data, People, Style) with specialized lenses when appropriate:
+- Art: "Artwork Details", "Composition", "Technique", "Symbols"
+- Architecture: "Architectural Features", "Structural Elements", "Materials"
+- Nature/Landscape: "Natural Elements", "Terrain", "Weather", "Flora & Fauna"
+- Food: "Food Items", "Presentation", "Ingredients"
+- Portraits: "Facial Features", "Expression", "Pose", "Clothing"
+- Events: "Activities", "Participants", "Setting"
+- Fashion: "Garments", "Accessories", "Styling"
+- Sports: "Action", "Equipment", "Players"
+- Documents: "Sections", "Headings", "Content Blocks"
+- Charts/Data: "Data Points", "Trends", "Labels", "Legend"
+- Screenshots: "UI Elements", "Content", "Navigation"
+- Products: "Product Features", "Packaging", "Branding"
+- Maps: "Locations", "Routes", "Markers", "Regions"
 
 CONTEXT:
 - Page title: ${pageTitle || 'Not available'}
 - Surrounding context: ${context || 'Not available'}
+- Host domain: ${hostDomain || 'Not available'}
 
 CRITICAL REQUIREMENTS - VISUAL CONTENTS DIRECTORY:
 
@@ -204,7 +149,7 @@ CRITICAL REQUIREMENTS - VISUAL CONTENTS DIRECTORY:
 
 2. imageText: Array of transcribed visible text strings (exact text, no quotes in JSON)
 
-3. lenses: Array of RotorLens objects matching recommendedLenses from planner. Each lens is a category of visual contents. Use the EXACT lens names from recommendedLenses - they may be specialized (e.g., "Artwork Details", "Food Items", "Architectural Features") or standard (e.g., "Text", "Objects", "Layout"). The lens id should be a lowercase, hyphenated version of the label (e.g., "Artwork Details" -> id: "artwork-details", "Food Items" -> id: "food-items").
+3. lenses: Array of RotorLens objects (4-7 lenses total). Each lens is a category of visual contents. Choose appropriate lenses based on the image type - they may be specialized (e.g., "Artwork Details", "Food Items", "Architectural Features") or standard (e.g., "Text", "Objects", "Layout"). The lens id should be a lowercase, hyphenated version of the label (e.g., "Artwork Details" -> id: "artwork-details", "Food Items" -> id: "food-items"). If text is present in the image, include a "Text" lens and prioritize it.
 
 4. Each RotorItem represents ONE DISTINCT VISUAL ELEMENT in the image:
    - id: stable id based on the visual element (e.g., "text-title-1", "object-person-center", "chart-sales-data")
@@ -246,7 +191,7 @@ CRITICAL REQUIREMENTS - VISUAL CONTENTS DIRECTORY:
    - Think: "What visual things are in this image?" not "What does this image mean?"
    - Organize by visual element type (text, objects, layout regions, data visualizations, etc.)
 
-6. Limit: 4-7 items max per lens (use lensSpecs.maxItems from planner). More specialized lenses may have fewer items, standard lenses may have more.
+6. Limit: 4-6 items max per lens. More specialized lenses may have fewer items, standard lenses may have more. Text lens should have max 6 items, Layout max 6 items.
 
 7. If uncertain about a visual element, set confidence to "low" and be honest about uncertainty
 
@@ -317,16 +262,16 @@ Output JSON (NOTE: altText will be provided separately, do not include it):
         ]
       }
     ],
-    max_tokens: 3000,
-    temperature: 0.2,
+    max_tokens: 2500,  // Reduced from 3000 for faster generation
+    temperature: 0.1,  // Lower for faster, more deterministic responses
     response_format: { type: 'json_object' }
   });
 
   let result = JSON.parse(response.choices[0].message.content);
 
   // TEXT-FIRST AUTO-PRIORITIZATION
-  // If hasText is true OR imageText has items, ensure Text lens is first
-  if (plannerResult.hasText || (result.imageText && result.imageText.length > 0)) {
+  // If imageText has items, ensure Text lens is first
+  if (result.imageText && result.imageText.length > 0) {
     // Find Text lens
     const textLensIndex = result.lenses.findIndex(l => 
       l.id === 'text' || l.label.toLowerCase() === 'text'
@@ -336,8 +281,8 @@ Output JSON (NOTE: altText will be provided separately, do not include it):
       // Move Text lens to first position
       const textLens = result.lenses.splice(textLensIndex, 1)[0];
       result.lenses.unshift(textLens);
-    } else if (textLensIndex === -1 && plannerResult.hasText) {
-      // Create Text lens if missing but planner says text exists
+    } else if (textLensIndex === -1) {
+      // Create Text lens if missing but text exists
       result.lenses.unshift({
         id: 'text',
         label: 'Text',
@@ -461,7 +406,7 @@ app.post('/api/describe-image', async (req, res) => {
       throw new Error('No image URL or base64 data provided');
     }
 
-    // Create low-detail version for planner (faster processing)
+    // Create low-detail version for alt-text (faster, doesn't need high detail)
     const imageContentLowDetail = {
       ...imageContentBase,
       image_url: {
@@ -470,22 +415,49 @@ app.post('/api/describe-image', async (req, res) => {
       }
     };
 
-    // Run alt-text and planner in parallel (planner uses low detail for speed)
-    console.log('[Server] Running alt-text generation and planner in parallel...');
-    const [altText, plannerResult] = await Promise.all([
-      generateAltText(imageContentBase, context, pageTitle),
-      runPlanner(imageContentLowDetail, context, pageTitle, hostDomain)
+    // Run alt-text (low detail) and generator (high detail) in parallel
+    // Alt-text doesn't need high detail - saves ~20-30% processing time
+    console.log('[Server] Running alt-text generation (low detail) and generator (high detail) in parallel...');
+    const [altText, result] = await Promise.all([
+      generateAltText(imageContentLowDetail, context, pageTitle),
+      runGenerator(imageContentBase, context, pageTitle, hostDomain)
     ]);
     console.log('[Server] Alt-text generated:', altText);
-    console.log('[Server] Planner result:', plannerResult);
-
-    // STAGE 2: Generator (depends on plannerResult, uses high detail)
-    console.log('[Server] Running generator...');
-    const result = await runGenerator(imageContentBase, plannerResult, context, pageTitle);
     console.log('[Server] Generator complete');
     
     // Replace altText with the one generated using original prompt
     result.altText = altText;
+
+    // TEXT-FIRST AUTO-PRIORITIZATION
+    // If imageText has items, ensure Text lens is first
+    if (result.imageText && result.imageText.length > 0) {
+      // Find Text lens
+      const textLensIndex = result.lenses.findIndex(l => 
+        l.id === 'text' || l.label.toLowerCase() === 'text'
+      );
+      
+      if (textLensIndex > 0) {
+        // Move Text lens to first position
+        const textLens = result.lenses.splice(textLensIndex, 1)[0];
+        result.lenses.unshift(textLens);
+      } else if (textLensIndex === -1) {
+        // Create Text lens if missing but text exists
+        result.lenses.unshift({
+          id: 'text',
+          label: 'Text',
+          items: result.imageText.map((text, i) => ({
+            id: `text-${i}`,
+            label: `Text: '${text.substring(0, 30)}'`,
+            focusSummary: `Text: ${text.substring(0, 20)}`,
+            description: `The text "${text}" appears in the image. It is clearly visible and readable.`,
+            regionHint: 'center',
+            confidence: 'high',
+            evidence: 'text',
+            salience: 5
+          }))
+        });
+      }
+    }
 
     // Cache the result
     cache.set(cacheKey, result);
