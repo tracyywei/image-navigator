@@ -26,58 +26,81 @@ chrome.commands.onCommand.addListener((command) => {
   });
 });
 
-// Handle API requests from content script (bypasses CORS)
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.action === 'describeImage') {
+// Handle API requests from content script (bypasses CORS).
+// The server streams newline-delimited JSON events; each one is forwarded over the
+// port as it arrives so the rotor can fill in progressively. Disconnecting the port
+// (panel closed, prefetch cancelled) aborts the request, which also stops the
+// server's OpenAI calls.
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'describeImage') return;
+
+  const abortController = new AbortController();
+  let disconnected = false;
+  port.onDisconnect.addListener(() => {
+    disconnected = true;
+    abortController.abort();
+  });
+
+  const post = (event) => {
+    if (!disconnected) port.postMessage(event);
+  };
+
+  port.onMessage.addListener(async (message) => {
     console.log('[Image Rotor Background] Proxying API request to:', API_BASE_URL);
-    
-    // First check health
-    fetch(`${API_BASE_URL}/health`)
-      .then(response => {
-        if (!response.ok) {
-          throw new Error(`Server health check failed: ${response.status}`);
-        }
-        console.log('[Image Rotor Background] Server is reachable');
-        
-        // Then make the actual API call
-        return fetch(`${API_BASE_URL}/api/describe-image`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(message.payload)
-        });
-      })
-      .then(response => {
-        if (!response.ok) {
-          return response.json().then(errorData => {
-            throw new Error(errorData.error || `HTTP ${response.status}: ${response.statusText}`);
-          });
-        }
-        return response.json();
-      })
-      .then(data => {
-        console.log('[Image Rotor Background] API call successful');
-        sendResponse({ success: true, data: data });
-      })
-      .catch(error => {
-        console.error('[Image Rotor Background] API call failed:', error);
-        console.error('[Image Rotor Background] Error details:', {
-          message: error.message,
-          stack: error.stack,
-          name: error.name
-        });
-        sendResponse({ 
-          success: false, 
-          error: error.message || 'Unknown error',
-          errorType: error.errorType || 'Network',
-          details: error.toString()
-        });
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/describe-image`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(message.payload),
+        signal: abortController.signal
       });
-    
-    return true; // Keep channel open for async response
-  }
-  
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        post({
+          type: 'error',
+          errorType: response.status === 500 ? 'Configuration' : 'Unknown',
+          message: errorData.message || errorData.error || `HTTP ${response.status}: ${response.statusText}`
+        });
+        post({ type: 'done' });
+        return;
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let sawDone = false;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let newline;
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, newline).trim();
+          buffer = buffer.slice(newline + 1);
+          if (!line) continue;
+          const event = JSON.parse(line);
+          if (event.type === 'done') sawDone = true;
+          post(event);
+        }
+      }
+      if (!sawDone) {
+        post({ type: 'error', errorType: 'Network', message: 'Connection to the server closed before analysis finished' });
+        post({ type: 'done' });
+      }
+    } catch (error) {
+      if (disconnected) return;
+      console.error('[Image Rotor Background] API call failed:', error);
+      post({
+        type: 'error',
+        errorType: 'Network',
+        message: error.message || 'Unknown error'
+      });
+      post({ type: 'done' });
+    }
+  });
 });
 
 // Handle context menu clicks

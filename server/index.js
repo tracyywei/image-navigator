@@ -3,9 +3,11 @@ import express from 'express';
 import cors from 'cors';
 import OpenAI from 'openai';
 import crypto from 'crypto';
+import sharp from 'sharp';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const MODEL = 'gpt-4o-mini';
 
 // Middleware
 app.use(cors());
@@ -20,8 +22,20 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
-// In-memory cache for image descriptions
+// In-memory cache for completed RotorResults
 const cache = new Map();
+
+// Fixed lens set the planner chooses from
+const LENSES = {
+  text: { label: 'Text', description: 'Only if text is prominent (documents, charts, screenshots, memes, signs)' },
+  objects: { label: 'Objects', description: 'Physical objects, items, things (not people)' },
+  people: { label: 'People', description: 'People, faces, human figures' },
+  layout: { label: 'Layout', description: 'Spatial organization, composition, regions, sections' },
+  background: { label: 'Background', description: 'Scene setting, environment, surroundings' },
+  colors: { label: 'Colors', description: 'Dominant colors, color schemes, palette' },
+  style: { label: 'Style', description: 'Visual style, artistic technique, aesthetic' },
+  data: { label: 'Data', description: 'Charts, graphs, data visualization elements (only for data images)' }
+};
 
 // Helper to generate cache key from image URL or base64 + context
 function getCacheKey(imageUrl, imageBase64, context, pageTitle) {
@@ -29,7 +43,7 @@ function getCacheKey(imageUrl, imageBase64, context, pageTitle) {
     .update((context || '') + (pageTitle || ''))
     .digest('hex')
     .substring(0, 8);
-  
+
   if (imageBase64) {
     const hash = crypto.createHash('sha256').update(imageBase64).digest('hex');
     return `base64:${hash}:ctx:${contextHash}`;
@@ -60,33 +74,103 @@ function parseRegionHint(hint) {
     'foreground': { x: 10, y: 60, width: 80, height: 35 },
     'background': { x: 20, y: 10, width: 60, height: 50 }
   };
-  
+
   if (hints[hint?.toLowerCase()]) {
     return hints[hint.toLowerCase()];
   }
-  
+
   const lowerHint = hint?.toLowerCase() || '';
   for (const [key, value] of Object.entries(hints)) {
     if (lowerHint.includes(key)) {
       return value;
     }
   }
-  
+
   return { x: 35, y: 35, width: 30, height: 30 };
 }
 
-// PLANNER REMOVED - Generator now handles all analysis in one call for better performance
+// Convert regionHint strings to coordinate objects for items and their subItems
+function addRegionCoords(items) {
+  for (const item of items) {
+    if (item.regionHint && typeof item.regionHint === 'string') {
+      item.regionHintCoords = parseRegionHint(item.regionHint);
+    }
+    if (Array.isArray(item.subItems)) {
+      addRegionCoords(item.subItems);
+    }
+  }
+}
+
+// Shrink the image to what OpenAI actually looks at. High detail fits the image in
+// 2048x2048 and then scales the short side down to 768px, so anything larger is just
+// upload time -- and the image is sent once per parallel call.
+async function shrinkImage(buffer, contentType) {
+  try {
+    const meta = await sharp(buffer).metadata();
+    let { width, height } = meta;
+    if (meta.orientation >= 5) [width, height] = [height, width];
+    const scale = Math.min(1, 2048 / Math.max(width, height), 768 / Math.min(width, height));
+    const output = await sharp(buffer)
+      .rotate()
+      .resize(Math.round(width * scale), Math.round(height * scale))
+      .flatten({ background: '#ffffff' })
+      .jpeg({ quality: 85 })
+      .toBuffer();
+    return { data: output.toString('base64'), contentType: 'image/jpeg' };
+  } catch (error) {
+    console.warn('[Server] Could not resize image, sending original:', error.message);
+    return { data: buffer.toString('base64'), contentType };
+  }
+}
+
+// Build the OpenAI image content part from the client's base64 or URL
+async function prepareImageContent(imageUrl, imageBase64) {
+  if (imageBase64) {
+    const match = imageBase64.match(/^data:(image\/[\w+.-]+);base64,/);
+    const buffer = Buffer.from(imageBase64.replace(/^data:image\/[\w+.-]+;base64,/, ''), 'base64');
+    const { data, contentType } = await shrinkImage(buffer, match?.[1] || 'image/jpeg');
+    return { type: 'image_url', image_url: { url: `data:${contentType};base64,${data}` } };
+  }
+
+  // Fetch the image server-side, which bypasses browser CORS restrictions
+  try {
+    console.log('[Server] Fetching image from URL:', imageUrl.substring(0, 100));
+    const imageResponse = await fetch(imageUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; ImageRotor/1.0)',
+        'Accept': 'image/*'
+      }
+    });
+
+    if (!imageResponse.ok) {
+      throw new Error(`Failed to fetch image: HTTP ${imageResponse.status} ${imageResponse.statusText}`);
+    }
+
+    const buffer = Buffer.from(await imageResponse.arrayBuffer());
+    if (buffer.length > 20 * 1024 * 1024) {
+      throw new Error('Image too large (exceeds 20MB limit)');
+    }
+
+    const { data, contentType } = await shrinkImage(buffer, imageResponse.headers.get('content-type') || 'image/jpeg');
+    console.log('[Server] Prepared image, size:', Math.round(data.length / 1024), 'KB');
+    return { type: 'image_url', image_url: { url: `data:${contentType};base64,${data}` } };
+  } catch (fetchError) {
+    console.warn('[Server] Failed to fetch image server-side, using URL directly:', fetchError.message);
+    // Fallback to using URL directly - OpenAI might be able to access it
+    return { type: 'image_url', image_url: { url: imageUrl } };
+  }
+}
 
 // Generate alt-text using original prompt
-async function generateAltText(imageContent, context, pageTitle) {
+async function generateAltText(imageContent, context, pageTitle, signal) {
   const altTextPrompt = `Write the alt-text for this image. I will provide the guidelines to follow for writing good alt-text (GUIDELINES), the title of the page where the image appears (PAGE TITLE), and the surrounding text (CONTEXT), which may provide additional details about the image's subject.
 
 GUIDELINES:
-1) Keep it short and clear: 1-2 lines of plain text with no acronyms, abbreviations, or jargon 
-2) Describe what can be seen: Don't add your own research, interpretation, or point of view 
-3) Focus on what is relevant to the article: consider the text around it as context, but don't repeat the text 
-4) Transcribe words and graphics: Write out any words in the image in quotation marks and summarize the main idea of maps, diagrams, and charts 
-5) Type of image: Do not start with 'This is an image of...' but describe the medium or style, if relevant 
+1) Keep it short and clear: 1-2 lines of plain text with no acronyms, abbreviations, or jargon
+2) Describe what can be seen: Don't add your own research, interpretation, or point of view
+3) Focus on what is relevant to the article: consider the text around it as context, but don't repeat the text
+4) Transcribe words and graphics: Write out any words in the image in quotation marks and summarize the main idea of maps, diagrams, and charts
+5) Type of image: Do not start with 'This is an image of...' but describe the medium or style, if relevant
 6) Take care with people: Only identify public figures and make sure any description is relevant, apparent, and verifiable.
 
 ${pageTitle ? `PAGE TITLE: ${pageTitle}` : ''}
@@ -96,7 +180,7 @@ ${context ? `CONTEXT: ${context}` : ''}
 Now provide the alt-text for this image.`;
 
   const response = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
+    model: MODEL,
     messages: [
       {
         role: 'user',
@@ -106,395 +190,344 @@ Now provide the alt-text for this image.`;
         ]
       }
     ],
-    max_tokens: 150,
+    max_tokens: 100,  // Alt-text is short
     temperature: 0.2
-  });
+  }, { signal });
 
   return response.choices[0].message.content.trim();
 }
 
-// GENERATOR - Full RotorResult generation (now handles all analysis in one call)
-async function runGenerator(imageContent, context, pageTitle, hostDomain) {
-  const generatorSystemPrompt = `You generate a visual contents directory for BLV users. Think of the rotor as a skimmable table of contents listing the actual visual elements present in the image. Each item represents a distinct visual element that can be found in the image. Output ONLY valid JSON that matches the schema exactly.`;
+const generatorSystemPrompt = `You generate a visual contents directory for BLV users. Think of the rotor as a skimmable table of contents listing the actual visual elements present in the image. Each item represents a distinct visual element that can be found in the image. Output ONLY valid JSON that matches the schema exactly.`;
 
-  const generatorUserPrompt = `Generate a complete RotorResult by analyzing this image. 
+// Map lens names from the planner to ids in the fixed lens set
+function normalizeLensIds(lenses) {
+  const ids = [];
+  for (const lens of lenses) {
+    const name = String(typeof lens === 'object' ? lens?.label || lens?.id : lens).trim().toLowerCase();
+    const id = Object.keys(LENSES).find(key => key === name || LENSES[key].label.toLowerCase() === name);
+    if (id && !ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
 
-IMPORTANT: Think of this rotor as a DIRECTORY OF VISUAL CONTENTS - like a table of contents for what's visually present in the image. Each lens organizes visual elements by type, and each item represents a specific visual element that exists in the image.
+// PLANNER - Picks imageType, taskHint and lenses, then transcribes imageText.
+// Streams so the lens calls can start as soon as the lens list is written,
+// without waiting for imageText (which can be long for documents).
+async function runPlanner(imageContent, promptContext, signal, onPlan) {
+  const plannerUserPrompt = `Analyze this image and plan a RotorResult. Think of the rotor as a directory of visual contents - a skimmable table of contents for what's visually present.
 
-First, classify the image type: "art", "architecture", "landscape", "portrait", "street", "nature", "food", "event", "interior", "fashion", "sports", "wildlife", "photo", "document", "chart", "screenshot", "meme", "product", "map", or "unknown".
+Classify imageType: "art", "architecture", "landscape", "portrait", "street", "nature", "food", "event", "interior", "fashion", "sports", "wildlife", "photo", "document", "chart", "screenshot", "meme", "product", "map", or "unknown".
 
-Based on the image type, organize visual contents into DIVERSE, DYNAMIC lenses (4-7 lenses). Mix standard lenses (Text, Objects, Layout, Data, People, Style) with specialized lenses when appropriate:
-- Art: "Artwork Details", "Composition", "Technique", "Symbols"
-- Architecture: "Architectural Features", "Structural Elements", "Materials"
-- Nature/Landscape: "Natural Elements", "Terrain", "Weather", "Flora & Fauna"
-- Food: "Food Items", "Presentation", "Ingredients"
-- Portraits: "Facial Features", "Expression", "Pose", "Clothing"
-- Events: "Activities", "Participants", "Setting"
-- Fashion: "Garments", "Accessories", "Styling"
-- Sports: "Action", "Equipment", "Players"
-- Documents: "Sections", "Headings", "Content Blocks"
-- Charts/Data: "Data Points", "Trends", "Labels", "Legend"
-- Screenshots: "UI Elements", "Content", "Navigation"
-- Products: "Product Features", "Packaging", "Branding"
-- Maps: "Locations", "Routes", "Markers", "Regions"
+Determine taskHint: "skim", "read_text", "data", "social", or "general".
 
-CONTEXT:
-- Page title: ${pageTitle || 'Not available'}
-- Surrounding context: ${context || 'Not available'}
-- Host domain: ${hostDomain || 'Not available'}
+Select 4-7 lenses from this FIXED SET based on what's relevant to the image, ordered most relevant first:
 
-CRITICAL REQUIREMENTS - VISUAL CONTENTS DIRECTORY:
+AVAILABLE LENSES (use these exact names):
+${Object.values(LENSES).map((lens, i) => `${i + 1}. "${lens.label}" - ${lens.description}`).join('\n')}
 
-1. altText: Will be provided separately (do not generate in this call)
+LENS SELECTION RULES:
+- Documents/Screenshots/Charts: Text, Layout, Data (if applicable), Objects
+- Photos with people: People, Objects, Background, Colors
+- Landscapes/Nature: Background, Objects, Colors, Style
+- Art/Illustrations: Style, Colors, Objects, Layout
+- Products: Objects, Colors, Background, Style
+- Architecture/Interior: Layout, Objects, Background, Style
+- Food: Objects, Colors, Background, Style
+- Always prioritize lenses with substantial content
+- Skip lenses with little/no relevant content
 
-2. imageText: Array of transcribed visible text strings (exact text, no quotes in JSON)
+Extract imageText: Array of all visible text strings (exact text, no quotes in JSON).
 
-3. lenses: Array of RotorLens objects (4-7 lenses total). Each lens is a category of visual contents. Choose appropriate lenses based on the image type - they may be specialized (e.g., "Artwork Details", "Food Items", "Architectural Features") or standard (e.g., "Text", "Objects", "Layout"). The lens id should be a lowercase, hyphenated version of the label (e.g., "Artwork Details" -> id: "artwork-details", "Food Items" -> id: "food-items"). If text is present in the image, include a "Text" lens and prioritize it.
+${promptContext}
 
-4. Each RotorItem represents ONE DISTINCT VISUAL ELEMENT in the image:
-   - id: stable id based on the visual element (e.g., "text-title-1", "object-person-center", "chart-sales-data")
-   - label: The visual element's name/title - MUST include actual content for skimmability:
-     * For text elements: Include the actual text! Format: "Text: '[actual text content]'" or "'[actual text]' (title)" - e.g., "Text: 'Welcome to Gallery'", "'Sales Report' (heading)", "'Click here' (button label)"
-     * For objects: Specific name with key attribute - e.g., "Red sedan car", "Woman in blue shirt", "Bar chart"
-     * For layout regions: "Left column", "Top header", "Center panel"
-     * For data: "Sales chart", "Pie chart: Q1", "Line graph"
-   - focusSummary: <= 8 words, quick preview with ACTUAL CONTENT when relevant:
-     * For text: Include the actual text! Format: "'[text]' at [location]" - e.g., "'Welcome' at top", "'Click here' button"
-     * For objects: "[Element] at [location]" - e.g., "Red car in foreground", "Chart showing sales"
-     * For data: Include key numbers/values if relevant - e.g., "Sales up 20%", "Q1: $50k"
-   - description: 2-4 sentences providing a slightly more detailed explanation of THIS SPECIFIC VISUAL ELEMENT. Focus on essential facts:
-     * What this visual element is and what it contains/shows (for text: include the full text; for charts: key data points)
-     * Where it appears (location, position)
-     * Key visual characteristics (size, color, style - only most important)
-     * Example for a text element: "The text 'Welcome to Our Gallery' appears at the top center in large bold black letters. It uses a modern sans-serif font and is centered on a white background."
-     * Example for an object: "A bright red sedan car is positioned in the center foreground. The car has four doors and chrome trim, appearing to be a modern compact design from around 2020."
-     * Example for a chart: "A bar chart shows sales data with Q1 at $50k, Q2 at $65k, and Q3 at $72k. The chart uses blue bars and is positioned in the center of the image."
-   - regionHint: "top-left" | "left" | "center" | "bottom" | "far" | etc (where this visual element is located)
-   - confidence: "high" | "medium" | "low"
-   - evidence: "visual" | "text" (optional)
-   - salience: 1-5 (5 = most important visual element for understanding the image)
-   - subItems: OPTIONAL array of RotorItem objects for drill-down navigation. Include sub-items when the visual element has multiple distinct aspects that can be explored:
-     * For people: ["Facial features", "Clothing", "Pose", "Expression", "Accessories"]
-     * For objects: ["Shape", "Color", "Size", "Position", "Material"]
-     * For text: ["Font style", "Size", "Color", "Position", "Content"]
-     * For charts: ["Data points", "Axes", "Legend", "Trends"]
-     * For architecture: ["Structural elements", "Materials", "Style", "Details"]
-     * Each sub-item should have: id, label, focusSummary, description, confidence, salience
-     * Limit: 3-6 sub-items per item (only include if the element has multiple explorable aspects)
-
-5. DIRECTORY STRUCTURE PRINCIPLES:
-   - Each item = one distinct visual element that can be found in the image
-   - Items should be organized like a table of contents - skimmable, scannable
-   - Labels should be clear, specific names of visual elements (not abstract descriptions)
-   - focusSummary = quick preview of what visual element this is
-   - description = full catalog entry describing this visual element in detail
-   - Think: "What visual things are in this image?" not "What does this image mean?"
-   - Organize by visual element type (text, objects, layout regions, data visualizations, etc.)
-
-6. Limit: 4-6 items max per lens. More specialized lenses may have fewer items, standard lenses may have more. Text lens should have max 6 items, Layout max 6 items.
-
-7. If uncertain about a visual element, set confidence to "low" and be honest about uncertainty
-
-8. Text lens items MUST:
-   - Have evidence: "text"
-   - Include the ACTUAL TRANSCRIBED TEXT in the label (format: "Text: '[text]'" or "'[text]' (type)")
-   - Include the ACTUAL TEXT in focusSummary (format: "'[text]' at [location]")
-   - Include the FULL TEXT in description (don't just say "title text" - include what it says)
-   - Match text from the imageText array when possible
-
-Output JSON (NOTE: altText will be provided separately, do not include it):
+Output JSON with the keys in exactly this order:
 {
-  "imageText": ["...", "..."],
   "imageType": "...",
   "taskHint": "...",
-  "lenses": [
-    {
-      "id": "text",
-      "label": "Text",
-      "items": [
-        {
-          "id": "text-title-1",
-          "label": "Text: 'Welcome to Our Gallery'",
-          "focusSummary": "'Welcome to Gallery' at top center",
-          "description": "The text 'Welcome to Our Gallery' appears at the top center of the image in large bold black letters, approximately 48 points in size. It uses a modern sans-serif font and is centered horizontally on a white background. The title is positioned about 10% from the top edge of the image and serves as the main heading. Below this title, a smaller gray subtitle is visible.",
-          "regionHint": "top-center",
-          "confidence": "high",
-          "evidence": "text",
-          "salience": 5,
-          "subItems": [
-            {
-              "id": "text-title-1-font",
-              "label": "Font style",
-              "focusSummary": "Modern sans-serif font",
-              "description": "The text uses a modern sans-serif font, likely Arial or Helvetica, in a bold weight. The font size is approximately 48 points, making it highly visible and prominent.",
-              "confidence": "high",
-              "salience": 3
-            },
-            {
-              "id": "text-title-1-position",
-              "label": "Position",
-              "focusSummary": "Top center placement",
-              "description": "The title is positioned at the top center of the image, approximately 10% from the top edge. It is horizontally centered and serves as the main visual anchor point.",
-              "confidence": "high",
-              "salience": 4
-            }
-          ]
-        },
-        ...
-      ]
-    },
-    ...
-  ]
+  "lenses": ["Text", "Objects", ...],
+  "imageText": ["..."]
+}`;
+
+  const stream = await openai.chat.completions.create({
+    model: MODEL,
+    messages: [
+      { role: 'system', content: generatorSystemPrompt },
+      { role: 'user', content: [{ type: 'text', text: plannerUserPrompt }, imageContent] }
+    ],
+    max_tokens: 1500,
+    temperature: 0.1,
+    response_format: { type: 'json_object' },
+    stream: true
+  }, { signal });
+
+  let text = '';
+  let plan = null;
+  try {
+    for await (const chunk of stream) {
+      text += chunk.choices[0]?.delta?.content || '';
+      if (plan) continue;
+      const lensMatch = text.match(/"lenses"\s*:\s*(\[[^\]]*\])/);
+      if (lensMatch) {
+        let lensIds = [];
+        try {
+          lensIds = normalizeLensIds(JSON.parse(lensMatch[1]));
+        } catch (e) {
+          // Handled by the empty check below
+        }
+        if (lensIds.length === 0) {
+          throw new Error('Invalid response structure from OpenAI - planner selected no lenses');
+        }
+        plan = {
+          imageType: text.match(/"imageType"\s*:\s*"([^"]*)"/)?.[1] || 'unknown',
+          taskHint: text.match(/"taskHint"\s*:\s*"([^"]*)"/)?.[1] || 'general',
+          lensIds
+        };
+        onPlan(plan);
+      }
+    }
+  } catch (error) {
+    // Once the lens calls are running, losing the rest of the stream only costs imageText
+    if (!plan || signal.aborted) throw error;
+    console.warn('[Planner] Stream failed after lenses were planned:', error.message);
+  }
+
+  if (!plan) {
+    throw new Error('Invalid response structure from OpenAI - missing lenses array');
+  }
+
+  let imageText = [];
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed.imageText)) imageText = parsed.imageText;
+  } catch (e) {
+    console.warn('[Planner] Could not parse imageText (response may have been truncated)');
+  }
+  return { ...plan, imageText };
+}
+
+// LENS GENERATOR - Full items for one lens. One call per lens, run in parallel,
+// so total time is the slowest lens rather than every lens added together.
+async function runLens(lensId, imageContent, plan, promptContext, signal) {
+  const lens = LENSES[lensId];
+  const otherLenses = plan.lensIds.filter(id => id !== lensId).map(id => LENSES[id].label);
+  const itemRange = lensId === 'text' || lensId === 'layout' ? '4-6' : '4-5';
+
+  const lensUserPrompt = `Analyze this image and generate ONE lens of a RotorResult: the "${lens.label}" lens (${lens.description}). Think of the rotor as a directory of visual contents - a skimmable table of contents for what's visually present.
+
+This image is classified as "${plan.imageType}".${otherLenses.length ? ` The rotor also has these lenses, generated separately: ${otherLenses.join(', ')}. Only include elements that belong in the ${lens.label} lens so items are not repeated across lenses.` : ''}
+
+${promptContext}
+
+Create ${itemRange} items. Each item:
+- id: unique identifier (e.g., "text-title-1", "objects-car-1")
+- label: Include actual content! Text: "'[text]'" or "'[text]' (type)". Objects: "Red car", "Woman in blue shirt". People: "Person in blue shirt", "Smiling woman". Layout: "Left column", "Top header". Colors: "Deep blue", "Warm orange tones". Background: "Snowy forest", "Urban street". Style: "Impressionist brushwork", "Minimalist design".
+- focusSummary: <= 8 words with actual content
+- description: 3-4 detailed sentences. Include: (1) What it is/shows with specific details, (2) Exact location and spatial context, (3) Visual characteristics (colors, textures, size, orientation), (4) Relationship to other elements or significance. Be specific and descriptive.
+- regionHint: "top-left" | "left" | "center" | "bottom" | etc
+- confidence: "high" | "medium" | "low"
+- evidence: "visual" | "text" (optional)
+- salience: 1-5 (5 = most important)
+- subItems: OPTIONAL, only for complex elements (3-4 max). For subItems, provide even MORE detail in descriptions (4-5 sentences): describe the specific feature, its visual properties, its relationship to the parent item, contextual significance, and any notable details that make it distinctive or important to understand the parent element fully.
+
+Output JSON:
+{
+  "items": [...]
 }`;
 
   const response = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
+    model: MODEL,
     messages: [
-      {
-        role: 'system',
-        content: generatorSystemPrompt
-      },
-      {
-        role: 'user',
-        content: [
-          { type: 'text', text: generatorUserPrompt },
-          imageContent
-        ]
-      }
+      { role: 'system', content: generatorSystemPrompt },
+      { role: 'user', content: [{ type: 'text', text: lensUserPrompt }, imageContent] }
     ],
-    max_tokens: 2500,  // Reduced from 3000 for faster generation
-    temperature: 0.1,  // Lower for faster, more deterministic responses
+    max_tokens: 3000,
+    temperature: 0.1,
     response_format: { type: 'json_object' }
-  });
+  }, { signal });
 
-  let result = JSON.parse(response.choices[0].message.content);
-
-  // TEXT-FIRST AUTO-PRIORITIZATION
-  // If imageText has items, ensure Text lens is first
-  if (result.imageText && result.imageText.length > 0) {
-    // Find Text lens
-    const textLensIndex = result.lenses.findIndex(l => 
-      l.id === 'text' || l.label.toLowerCase() === 'text'
-    );
-    
-    if (textLensIndex > 0) {
-      // Move Text lens to first position
-      const textLens = result.lenses.splice(textLensIndex, 1)[0];
-      result.lenses.unshift(textLens);
-    } else if (textLensIndex === -1) {
-      // Create Text lens if missing but text exists
-      result.lenses.unshift({
-        id: 'text',
-        label: 'Text',
-        items: result.imageText.map((text, i) => ({
-          id: `text-${i}`,
-          label: `Text: '${text.substring(0, 30)}'`,
-          focusSummary: `Text: ${text.substring(0, 20)}`,
-          description: `The text "${text}" appears in the image. It is clearly visible and readable.`,
-          regionHint: 'center',
-          confidence: 'high',
-          evidence: 'text',
-          salience: 5
-        }))
-      });
-    }
+  if (response.choices[0].finish_reason === 'length') {
+    throw new Error(`${lens.label} lens hit the output token limit`);
   }
 
-  // Convert regionHint strings to coordinate objects for items
-  for (const lens of result.lenses) {
-    for (const item of lens.items) {
-      if (item.regionHint && typeof item.regionHint === 'string') {
-        item.regionHintCoords = parseRegionHint(item.regionHint);
-      }
-    }
+  const result = JSON.parse(response.choices[0].message.content);
+  if (!Array.isArray(result.items) || result.items.length === 0) {
+    throw new Error(`Invalid response structure from OpenAI - ${lens.label} lens has no items`);
   }
 
-  return result;
+  addRegionCoords(result.items);
+  return { id: lensId, label: lens.label, items: result.items };
 }
 
-// API route to describe image (2-stage pipeline)
+// Map an error to the errorType/message the extension shows the user
+function classifyError(error) {
+  let errorMessage = error.message || 'Unknown error';
+  let errorType = 'Unknown';
+
+  if (error.message?.includes('API key')) {
+    errorType = 'Configuration';
+    errorMessage = 'OpenAI API key is not configured or invalid';
+  } else if (error.message?.includes('fetch') || error.message?.includes('network')) {
+    errorType = 'Network';
+    errorMessage = 'Network error while accessing image or OpenAI API';
+  } else if (error.message?.includes('JSON') || error.message?.includes('parse')) {
+    errorType = 'Parsing';
+    errorMessage = 'Failed to parse response from OpenAI';
+  } else if (error.message?.includes('rate limit') || error.message?.includes('429')) {
+    errorType = 'RateLimit';
+    errorMessage = 'OpenAI API rate limit exceeded. Please try again later.';
+  } else if (error.message?.includes('image') || error.message?.includes('URL')) {
+    errorType = 'ImageAccess';
+    errorMessage = `Cannot access image at URL. The image may require authentication or be blocked. Original error: ${error.message}`;
+  }
+
+  return { errorType, message: errorMessage };
+}
+
+// API route to describe image. Responds with newline-delimited JSON events so the
+// extension can show each part as soon as it is ready:
+//   {type: 'altText', altText}
+//   {type: 'plan', imageType, taskHint, lenses: [{id, label}]}
+//   {type: 'lens', lens}                    (one per lens, in completion order)
+//   {type: 'lensError', id, message}
+//   {type: 'imageText', imageText}
+//   {type: 'altTextError', message}
+//   {type: 'error', errorType, message}     (analysis failed; no more lenses coming)
+//   {type: 'done'}
 app.post('/api/describe-image', async (req, res) => {
-  try {
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ 
-        error: 'OpenAI API key not configured',
-        message: 'Please set the OPENAI_API_KEY environment variable'
-      });
-    }
-
-    const { imageUrl, imageBase64, context, pageTitle } = req.body;
-
-    if (!imageUrl && !imageBase64) {
-      return res.status(400).json({ error: 'Either imageUrl or imageBase64 is required' });
-    }
-
-    // Extract host domain from imageUrl if available
-    let hostDomain = null;
-    try {
-      if (imageUrl) {
-        const url = new URL(imageUrl);
-        hostDomain = url.hostname;
-      }
-    } catch (e) {
-      // Ignore
-    }
-
-    // Check cache
-    const cacheKey = getCacheKey(imageUrl, imageBase64, context, pageTitle);
-    if (cache.has(cacheKey)) {
-      console.log('Cache hit for:', cacheKey.substring(0, 50));
-      return res.json(cache.get(cacheKey));
-    }
-
-    // Prepare image for OpenAI
-    // Create two versions: one with low detail for planner (faster), one with high detail for generator
-    let imageContentBase;
-    if (imageBase64) {
-      const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, '');
-      imageContentBase = {
-        type: 'image_url',
-        image_url: {
-          url: `data:image/jpeg;base64,${base64Data}`
-        }
-      };
-    } else if (imageUrl) {
-      // Try to fetch the image server-side and convert to base64
-      // This bypasses CORS restrictions since the server can fetch from any origin
-      try {
-        console.log('[Server] Fetching image from URL to convert to base64:', imageUrl.substring(0, 100));
-        
-        // Use native fetch (available in Node.js 18+)
-        const imageResponse = await fetch(imageUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (compatible; ImageRotor/1.0)',
-            'Accept': 'image/*'
-          }
-        });
-        
-        if (!imageResponse.ok) {
-          throw new Error(`Failed to fetch image: HTTP ${imageResponse.status} ${imageResponse.statusText}`);
-        }
-        
-        const imageBuffer = await imageResponse.arrayBuffer();
-        const imageBase64FromServer = Buffer.from(imageBuffer).toString('base64');
-        const contentType = imageResponse.headers.get('content-type') || 'image/jpeg';
-        
-        // Limit image size to avoid OpenAI API limits (max ~20MB for base64)
-        if (imageBase64FromServer.length > 20 * 1024 * 1024) {
-          throw new Error('Image too large (exceeds 20MB limit)');
-        }
-        
-        console.log('[Server] Successfully converted image URL to base64, size:', Math.round(imageBase64FromServer.length / 1024), 'KB');
-        imageContentBase = {
-          type: 'image_url',
-          image_url: {
-            url: `data:${contentType};base64,${imageBase64FromServer}`
-          }
-        };
-      } catch (fetchError) {
-        console.warn('[Server] Failed to fetch image server-side, using URL directly:', fetchError.message);
-        console.warn('[Server] OpenAI will attempt to fetch the image URL directly');
-        // Fallback to using URL directly - OpenAI might be able to access it
-        imageContentBase = {
-          type: 'image_url',
-          image_url: {
-            url: imageUrl
-          }
-        };
-      }
-    } else {
-      throw new Error('No image URL or base64 data provided');
-    }
-
-    // Create low-detail version for alt-text (faster, doesn't need high detail)
-    const imageContentLowDetail = {
-      ...imageContentBase,
-      image_url: {
-        ...imageContentBase.image_url,
-        detail: 'low'
-      }
-    };
-
-    // Run alt-text (low detail) and generator (high detail) in parallel
-    // Alt-text doesn't need high detail - saves ~20-30% processing time
-    console.log('[Server] Running alt-text generation (low detail) and generator (high detail) in parallel...');
-    const [altText, result] = await Promise.all([
-      generateAltText(imageContentLowDetail, context, pageTitle),
-      runGenerator(imageContentBase, context, pageTitle, hostDomain)
-    ]);
-    console.log('[Server] Alt-text generated:', altText);
-    console.log('[Server] Generator complete');
-    
-    // Replace altText with the one generated using original prompt
-    result.altText = altText;
-
-    // TEXT-FIRST AUTO-PRIORITIZATION
-    // If imageText has items, ensure Text lens is first
-    if (result.imageText && result.imageText.length > 0) {
-      // Find Text lens
-      const textLensIndex = result.lenses.findIndex(l => 
-        l.id === 'text' || l.label.toLowerCase() === 'text'
-      );
-      
-      if (textLensIndex > 0) {
-        // Move Text lens to first position
-        const textLens = result.lenses.splice(textLensIndex, 1)[0];
-        result.lenses.unshift(textLens);
-      } else if (textLensIndex === -1) {
-        // Create Text lens if missing but text exists
-        result.lenses.unshift({
-          id: 'text',
-          label: 'Text',
-          items: result.imageText.map((text, i) => ({
-            id: `text-${i}`,
-            label: `Text: '${text.substring(0, 30)}'`,
-            focusSummary: `Text: ${text.substring(0, 20)}`,
-            description: `The text "${text}" appears in the image. It is clearly visible and readable.`,
-            regionHint: 'center',
-            confidence: 'high',
-            evidence: 'text',
-            salience: 5
-          }))
-        });
-      }
-    }
-
-    // Cache the result
-    cache.set(cacheKey, result);
-
-    res.json(result);
-  } catch (error) {
-    console.error('Error describing image:', error);
-    console.error('Error stack:', error.stack);
-    
-    // Provide more specific error messages
-    let errorMessage = error.message || 'Unknown error';
-    let errorType = 'Unknown';
-    
-    if (error.message?.includes('API key')) {
-      errorType = 'Configuration';
-      errorMessage = 'OpenAI API key is not configured or invalid';
-    } else if (error.message?.includes('fetch') || error.message?.includes('network')) {
-      errorType = 'Network';
-      errorMessage = 'Network error while accessing image or OpenAI API';
-    } else if (error.message?.includes('JSON') || error.message?.includes('parse')) {
-      errorType = 'Parsing';
-      errorMessage = 'Failed to parse response from OpenAI';
-    } else if (error.message?.includes('rate limit') || error.message?.includes('429')) {
-      errorType = 'RateLimit';
-      errorMessage = 'OpenAI API rate limit exceeded. Please try again later.';
-    } else if (error.message?.includes('image') || error.message?.includes('URL')) {
-      errorType = 'ImageAccess';
-      errorMessage = `Cannot access image at URL. The image may require authentication or be blocked. Original error: ${error.message}`;
-    }
-    
-    res.status(500).json({ 
-      error: 'Failed to describe image',
-      errorType: errorType,
-      message: errorMessage,
-      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+  if (!process.env.OPENAI_API_KEY) {
+    return res.status(500).json({
+      error: 'OpenAI API key not configured',
+      message: 'Please set the OPENAI_API_KEY environment variable'
     });
   }
+
+  const { imageUrl, imageBase64, context, pageTitle } = req.body;
+
+  if (!imageUrl && !imageBase64) {
+    return res.status(400).json({ error: 'Either imageUrl or imageBase64 is required' });
+  }
+
+  res.setHeader('Content-Type', 'application/x-ndjson');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.flushHeaders();
+  const send = (event) => {
+    if (!res.writableEnded && !res.destroyed) res.write(JSON.stringify(event) + '\n');
+  };
+
+  // Check cache
+  const cacheKey = getCacheKey(imageUrl, imageBase64, context, pageTitle);
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    console.log('Cache hit for:', cacheKey.substring(0, 50));
+    send({ type: 'altText', altText: cached.altText });
+    send({ type: 'plan', imageType: cached.imageType, taskHint: cached.taskHint, lenses: cached.lenses.map(({ id, label }) => ({ id, label })) });
+    for (const lens of cached.lenses) send({ type: 'lens', lens });
+    send({ type: 'imageText', imageText: cached.imageText });
+    send({ type: 'done' });
+    return res.end();
+  }
+
+  // Stop paying for OpenAI calls if the extension goes away (panel closed, prefetch cancelled)
+  const abortController = new AbortController();
+  const { signal } = abortController;
+  res.on('close', () => {
+    if (!res.writableFinished) {
+      console.log('[Server] Client disconnected, cancelling analysis');
+      abortController.abort();
+    }
+  });
+
+  // Extract host domain from imageUrl if available
+  let hostDomain = null;
+  try {
+    if (imageUrl) hostDomain = new URL(imageUrl).hostname;
+  } catch (e) {
+    // Ignore
+  }
+  const promptContext = `Context: Page: ${pageTitle || 'N/A'}, Context: ${context || 'N/A'}, Domain: ${hostDomain || 'N/A'}`;
+
+  const startTime = Date.now();
+  const elapsed = () => `${Date.now() - startTime}ms`;
+  const result = { altText: null, imageType: 'unknown', taskHint: 'general', imageText: [], lenses: [] };
+  const lensResults = {};
+  const lensPromises = [];
+  let altPromise = Promise.resolve();
+  let complete = true;
+
+  try {
+    const imageContent = await prepareImageContent(imageUrl, imageBase64);
+    console.log(`[Server] Image ready in ${elapsed()}`);
+
+    // Low detail is enough for alt-text and much cheaper
+    const imageContentLowDetail = {
+      ...imageContent,
+      image_url: { ...imageContent.image_url, detail: 'low' }
+    };
+
+    altPromise = generateAltText(imageContentLowDetail, context, pageTitle, signal)
+      .then(altText => {
+        console.log(`[Server] Alt-text ready in ${elapsed()}:`, altText);
+        result.altText = altText;
+        send({ type: 'altText', altText });
+      })
+      .catch(error => {
+        complete = false;
+        if (signal.aborted) return;
+        console.error('[Server] Alt-text failed:', error.message);
+        send({ type: 'altTextError', message: classifyError(error).message });
+      });
+
+    const plan = await runPlanner(imageContent, promptContext, signal, (plan) => {
+      console.log(`[Server] Plan ready in ${elapsed()}:`, plan.imageType, plan.lensIds.join(', '));
+      result.imageType = plan.imageType;
+      result.taskHint = plan.taskHint;
+      send({
+        type: 'plan',
+        imageType: plan.imageType,
+        taskHint: plan.taskHint,
+        lenses: plan.lensIds.map(id => ({ id, label: LENSES[id].label }))
+      });
+
+      for (const lensId of plan.lensIds) {
+        lensPromises.push(
+          runLens(lensId, imageContent, plan, promptContext, signal)
+            .then(lens => {
+              console.log(`[Server] ${lens.label} lens ready in ${elapsed()} (${lens.items.length} items)`);
+              lensResults[lensId] = lens;
+              send({ type: 'lens', lens });
+            })
+            .catch(error => {
+              complete = false;
+              if (signal.aborted) return;
+              console.error(`[Server] ${LENSES[lensId].label} lens failed:`, error.message);
+              send({ type: 'lensError', id: lensId, message: classifyError(error).message });
+            })
+        );
+      }
+    });
+
+    result.imageText = plan.imageText;
+    send({ type: 'imageText', imageText: plan.imageText });
+
+    await Promise.all(lensPromises);
+    await altPromise;
+    console.log(`[Server] Analysis complete in ${elapsed()}`);
+
+    // Only cache complete results so a failed lens can be retried
+    result.lenses = plan.lensIds.map(id => lensResults[id]).filter(Boolean);
+    if (complete && !signal.aborted) {
+      cache.set(cacheKey, result);
+    }
+  } catch (error) {
+    if (!signal.aborted) {
+      console.error('Error describing image:', error);
+      send({ type: 'error', ...classifyError(error) });
+    }
+    await Promise.allSettled([altPromise, ...lensPromises]);
+  }
+
+  send({ type: 'done' });
+  res.end();
 });
 
 // Health check

@@ -22,8 +22,6 @@
   let currentLens = null; // Will be set to first lens dynamically
   let focusedIndex = 0;
   let isRotorFocused = false;
-  let imageDataCache = new Map();
-  let isLoading = false;
   let hasSpokenAltText = false;
   let lastLensSpoken = null; // Track last lens label spoken to avoid repetition
   let lastSelectedItemId = null; // Track last selected item to avoid re-speaking
@@ -37,6 +35,9 @@
   let pageImages = [];
   let focusedImageIndex = -1;
   let imageHighlightOverlay = null;
+  const PREFETCH_DELAY_MS = 700;
+  let prefetchTimer = null;
+  let prefetchedAnalysis = null;
 
   // Lens configuration - will be populated dynamically from API response
   let lensOrder = [];
@@ -314,319 +315,290 @@
   const predictiveOrderer = new PredictiveOrderer();
 
   // API Client functions
-  async function imageToBase64(img) {
+  function imageToBase64(img) {
+    const src = img.currentSrc || img.src;
+    const isSameOrigin = src.startsWith('data:') || new URL(src, location.href).origin === location.origin;
+
     return new Promise((resolve, reject) => {
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-      img.crossOrigin = 'anonymous';
-      
-      img.onload = () => {
-        canvas.width = img.naturalWidth;
-        canvas.height = img.naturalHeight;
-        ctx.drawImage(img, 0, 0);
+      const draw = (source) => {
+        const width = source.naturalWidth;
+        const height = source.naturalHeight;
+        if (!width || !height) {
+          reject(new Error('Image has no size'));
+          return;
+        }
+        // Match what OpenAI's high-detail mode keeps (fit in 2048px, short side 768px);
+        // anything bigger is only extra upload time
+        const scale = Math.min(1, 2048 / Math.max(width, height), 768 / Math.min(width, height));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(width * scale);
+        canvas.height = Math.round(height * scale);
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff'; // JPEG has no transparency
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
         try {
-          const base64 = canvas.toDataURL('image/jpeg', 0.9);
-          resolve(base64);
+          resolve(canvas.toDataURL('image/jpeg', 0.85));
         } catch (error) {
           reject(new Error('Failed to convert image to base64: ' + error.message));
         }
       };
-      
-      img.onerror = () => reject(new Error('Failed to load image'));
-      
-      if (img.complete && img.naturalHeight !== 0) {
-        img.onload();
+
+      // Same-origin images can be drawn straight from the page, with no new download
+      if (isSameOrigin && img.complete && img.naturalWidth) {
+        draw(img);
+        return;
       }
+
+      // Cross-origin images need a CORS-enabled copy. Loading it into a separate element
+      // leaves the page's own image alone.
+      const copy = new Image();
+      copy.crossOrigin = 'anonymous';
+      const timeout = setTimeout(() => reject(new Error('Timed out loading image')), 3000);
+      copy.onload = () => {
+        clearTimeout(timeout);
+        draw(copy);
+      };
+      copy.onerror = () => {
+        clearTimeout(timeout);
+        reject(new Error('Failed to load image with CORS'));
+      };
+      copy.src = src;
     });
   }
 
   function getImageContext(img) {
     const context = [];
+    
+    // Helper to clean and extract text from element
+    const extractText = (element) => {
+      if (!element) return '';
+      
+      // Get text content but exclude script, style, and hidden elements
+      let clone = element.cloneNode(true);
+      let scripts = clone.querySelectorAll('script, style, noscript');
+      scripts.forEach(s => s.remove());
+      
+      let text = clone.textContent?.trim() || '';
+      
+      // Remove excessive whitespace
+      text = text.replace(/\s+/g, ' ').trim();
+      
+      return text;
+    };
+    
+    // 1. Check for figure/figcaption (common HTML5 pattern)
+    const figure = img.closest('figure');
+    if (figure) {
+      const figcaption = figure.querySelector('figcaption');
+      if (figcaption) {
+        const captionText = extractText(figcaption);
+        if (captionText && captionText.length > 0) {
+          context.push(`[Caption: ${captionText}]`);
+        }
+      }
+    }
+    
+    // 2. Check for nearby caption-like elements (by class/id)
+    const captionSelectors = [
+      '[class*="caption"]',
+      '[class*="credit"]',
+      '[id*="caption"]',
+      '.wp-caption-text',
+      '.image-caption'
+    ];
+    
+    let captionElement = null;
     const parent = img.parentElement;
     if (parent) {
-      const parentText = parent.textContent?.trim();
-      if (parentText && parentText.length > 0 && parentText.length < 500) {
-        context.push(parentText);
+      for (const selector of captionSelectors) {
+        captionElement = parent.querySelector(selector);
+        if (captionElement) {
+          const captionText = extractText(captionElement);
+          if (captionText && captionText.length > 0 && captionText.length < 300) {
+            context.push(`[Caption: ${captionText}]`);
+            break;
+          }
+        }
       }
     }
-    let sibling = img.previousElementSibling;
-    if (sibling) {
-      const siblingText = sibling.textContent?.trim();
-      if (siblingText && siblingText.length > 0 && siblingText.length < 300) {
-        context.push(siblingText);
+    
+    // 3. Look for surrounding paragraph text (before and after)
+    const findNearestParagraph = (startElement, direction = 'previous') => {
+      let current = startElement;
+      let depth = 0;
+      const maxDepth = 5; // Limit how far we search
+      
+      while (current && depth < maxDepth) {
+        const sibling = direction === 'previous' ? 
+          current.previousElementSibling : 
+          current.nextElementSibling;
+        
+        if (sibling) {
+          // Check if it's a paragraph or text-containing block element
+          if (sibling.matches('p, div[class*="text"], div[class*="paragraph"], blockquote, li')) {
+            const text = extractText(sibling);
+            if (text && text.length > 20 && text.length < 400) {
+              return text;
+            }
+          }
+          current = sibling;
+        } else {
+          // Go up one level and continue searching
+          current = current.parentElement;
+          depth++;
+        }
+      }
+      return null;
+    };
+    
+    // Get preceding paragraph
+    const precedingParagraph = findNearestParagraph(img, 'previous');
+    if (precedingParagraph) {
+      context.push(precedingParagraph);
+    }
+    
+    // Get following paragraph
+    const followingParagraph = findNearestParagraph(img, 'next');
+    if (followingParagraph) {
+      context.push(followingParagraph);
+    }
+    
+    // 4. If no context found, fall back to parent text (but filter out the alt text itself)
+    if (context.length === 0 && parent) {
+      const parentText = extractText(parent);
+      const altText = img.alt || '';
+      const filteredText = parentText.replace(altText, '').trim();
+      
+      if (filteredText && filteredText.length > 10 && filteredText.length < 500) {
+        context.push(filteredText);
       }
     }
-    sibling = img.nextElementSibling;
-    if (sibling) {
-      const siblingText = sibling.textContent?.trim();
-      if (siblingText && siblingText.length > 0 && siblingText.length < 300) {
-        context.push(siblingText);
-      }
-    }
-    return context.join(' ').substring(0, 500);
+    
+    // Join and limit total context length
+    const finalContext = context.join(' ').substring(0, 600);
+    
+    console.log('[Image Rotor] Extracted context:', finalContext.substring(0, 100) + '...');
+    
+    return finalContext;
   }
 
   function getPageTitle() {
     return document.title || '';
   }
 
-  function getCacheKey(imageUrl, imageBase64) {
-    if (imageBase64) {
-      // Simple hash from base64
-      let hash = 0;
-      for (let i = 0; i < imageBase64.length; i++) {
-        const char = imageBase64.charCodeAt(i);
-        hash = ((hash << 5) - hash) + char;
-        hash = hash & hash;
-      }
-      return `base64:${hash}`;
+  // Analyses keyed by image URL. Each streams events from the server and keeps
+  // everything received so far, so a panel opened mid-analysis (e.g. after a
+  // prefetch) replays what already arrived and then follows along.
+  const analyses = new Map();
+
+  function getAnalysis(img) {
+    let analysis = analyses.get(img.src);
+    if (!analysis) {
+      analysis = startAnalysis(img);
+      analyses.set(img.src, analysis);
     }
-    return `url:${imageUrl}`;
+    return analysis;
   }
 
-  async function describeImage(img) {
-    const imageUrl = img.src || (img instanceof Image ? img.src : null);
-    
-    if (!imageUrl) {
-      throw new Error('No image URL available');
-    }
-    
-    // Check cache
-    const cacheKey = getCacheKey(imageUrl, null);
-    if (imageDataCache.has(cacheKey)) {
-      console.log('[Image Rotor] Cache hit for image:', imageUrl.substring(0, 50));
-      return imageDataCache.get(cacheKey);
-    }
+  function startAnalysis(img) {
+    const analysis = {
+      imageUrl: img.src,
+      events: [],
+      listeners: new Set(),
+      port: null,
+      done: false,
+      failed: false,
+      cancelled: false
+    };
 
-    isLoading = true;
-    updateLoadingState(true);
+    const emit = (event) => {
+      analysis.events.push(event);
+      if (event.type === 'error' || event.type === 'lensError' || event.type === 'altTextError') {
+        analysis.failed = true;
+      }
+      if (event.type === 'done') {
+        analysis.done = true;
+        analysis.port?.disconnect();
+        // Forget failed analyses so opening the image again retries
+        if (analysis.failed && analyses.get(analysis.imageUrl) === analysis) {
+          analyses.delete(analysis.imageUrl);
+        }
+      }
+      analysis.listeners.forEach(listener => listener(event));
+    };
 
-    try {
+    (async () => {
       let imageBase64 = null;
       // Only try to convert to base64 if the image is in the DOM and accessible
       // Skip if it's a virtual image object (created from context menu)
       if (!img.isVirtual && img instanceof HTMLImageElement && document.contains(img)) {
         try {
           imageBase64 = await imageToBase64(img);
-          console.log('[Image Rotor] Successfully converted image to base64');
+          console.log('[Image Rotor] Converted image to base64,', Math.round(imageBase64.length / 1024), 'KB');
         } catch (error) {
           console.warn('[Image Rotor] Failed to convert image to base64 (CORS or other issue), using URL instead:', error.message);
-          // Continue with URL - that's fine
+          // Continue with URL - the server fetches it
         }
       } else {
         console.log('[Image Rotor] Image not in DOM or virtual object, using URL directly');
       }
+      if (analysis.cancelled) return;
 
       const context = img instanceof HTMLImageElement && document.contains(img) ? getImageContext(img) : '';
-      const pageTitle = getPageTitle();
 
-      console.log('[Image Rotor] Requesting API call through background script');
-      console.log('[Image Rotor] Image URL:', imageUrl.substring(0, 100));
-      
       // Use background script to proxy the API call (bypasses CORS)
-      const response = await new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage({
-          action: 'describeImage',
-          payload: {
-            imageUrl: imageBase64 ? null : imageUrl,
-            imageBase64: imageBase64,
-            context: context,
-            pageTitle: pageTitle
-          }
-        }, (response) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error(`Background script error: ${chrome.runtime.lastError.message}`));
-          } else if (response && response.success) {
-            resolve(response.data);
-          } else {
-            // Provide more detailed error message
-            const errorMsg = response?.error || 'Unknown error from background script';
-            const errorType = response?.errorType || 'Unknown';
-            const error = new Error(errorMsg);
-            error.errorType = errorType;
-            error.details = response?.details;
-            reject(error);
-          }
-        });
-      });
-
-      console.log('[Image Rotor] API response received:', {
-        hasAltText: !!response.altText,
-        hasLenses: !!response.lenses,
-        lensCounts: response.lenses ? {
-          objects: response.lenses.objects?.length || 0,
-          layout: response.lenses.layout?.length || 0,
-          style: response.lenses.style?.length || 0
-        } : null
-      });
-      
-      // Transform OpenAI response to our format
-      const transformedData = transformOpenAIResponse(response, imageUrl);
-      
-      // Cache the result
-      imageDataCache.set(cacheKey, transformedData);
-      
-      return transformedData;
-    } catch (error) {
-      console.error('[Image Rotor] Error describing image:', error);
-      console.error('[Image Rotor] Error details:', {
-        message: error.message,
-        errorType: error.errorType,
-        details: error.details,
-        stack: error.stack
-      });
-      
-      // Show error to user with more helpful message
-      let userMessage = `Error: ${error.message}`;
-      
-      if (error.errorType === 'ImageAccess') {
-        userMessage = `Cannot access image. The image may be blocked by CORS or require authentication. Try right-clicking the image and selecting "Analyze with Image Rotor" instead.`;
-      } else if (error.errorType === 'Network') {
-        userMessage = `Network error. Make sure the server is running at ${API_BASE_URL} and check your internet connection.`;
-      } else if (error.errorType === 'Configuration') {
-        userMessage = `Server configuration error: ${error.message}`;
-      } else if (error.errorType === 'RateLimit') {
-        userMessage = `OpenAI API rate limit exceeded. Please try again in a few moments.`;
-      }
-      
-      // Show error to user
-      if (rotorPanel) {
-        const altTextEl = rotorPanel.querySelector('.ir-alt-text');
-        if (altTextEl) {
-          altTextEl.textContent = userMessage;
-          altTextEl.style.color = '#ef4444';
+      const port = chrome.runtime.connect({ name: 'describeImage' });
+      analysis.port = port;
+      port.onMessage.addListener(emit);
+      port.onDisconnect.addListener(() => {
+        if (!analysis.done && !analysis.cancelled) {
+          emit({ type: 'error', errorType: 'Unknown', message: `Background script error: ${chrome.runtime.lastError?.message || 'disconnected'}` });
+          emit({ type: 'done' });
         }
-      }
-      
-      // Return fallback data
-      return createFallbackData(imageUrl, img.alt);
-    } finally {
-      isLoading = false;
-      updateLoadingState(false);
+      });
+      port.postMessage({
+        payload: {
+          imageUrl: imageBase64 ? null : analysis.imageUrl,
+          imageBase64: imageBase64,
+          context: context,
+          pageTitle: getPageTitle()
+        }
+      });
+    })();
+
+    return analysis;
+  }
+
+  // Stop an unfinished analysis; the server cancels its OpenAI calls when the stream closes
+  function cancelAnalysis(analysis) {
+    if (!analysis || analysis.done) return;
+    analysis.cancelled = true;
+    analysis.port?.disconnect();
+    if (analyses.get(analysis.imageUrl) === analysis) {
+      analyses.delete(analysis.imageUrl);
     }
   }
 
-  function transformOpenAIResponse(data, imageUrl) {
-    console.log('[Image Rotor] Transforming response:', data);
-    
-    // Handle new RotorResult format (lenses as array) or legacy format
-    let result;
-    
-    if (Array.isArray(data.lenses)) {
-      // New format: RotorResult with lenses array
-      result = {
-        altText: data.altText || 'Image description unavailable',
-        imageText: data.imageText || [],
-        imageUrl: imageUrl,
-        imageType: data.imageType || 'unknown',
-        taskHint: data.taskHint || 'general',
-        lenses: data.lenses.map(lens => ({
-          id: lens.id,
-          label: lens.label,
-          items: lens.items.map(item => ({
-            id: item.id,
-            label: item.label,
-            focusSummary: item.focusSummary || item.label,
-            description: item.description || `Description for ${item.label}`,
-            regionHint: item.regionHint || 'center',
-            regionHintCoords: item.regionHintCoords || parseRegionHint(item.regionHint || 'center'),
-            confidence: item.confidence || 'medium',
-            evidence: item.evidence,
-            salience: item.salience || 3,
-          }))
-        }))
-      };
-    } else if (data.lenses && typeof data.lenses === 'object') {
-      // Legacy format: lenses as object with keys
-      const lenses = {};
-      lensOrder = [];
-      lensLabels = {};
-      lensDescriptions = {};
-      
-      for (const [lensKey, lensData] of Object.entries(data.lenses)) {
-        let items = [];
-        let name = lensKey;
-        let description = '';
-        
-        if (lensData && typeof lensData === 'object' && lensData.items) {
-          items = lensData.items || [];
-          name = lensData.name || lensKey;
-          description = lensData.description || '';
-        } else if (Array.isArray(lensData)) {
-          items = lensData;
-          const defaultNames = { objects: 'Objects', layout: 'Layout', style: 'Style' };
-          name = defaultNames[lensKey] || lensKey;
-          description = 'Explore items in this category';
-        }
-        
-        const itemDetails = data.itemDetails || {};
-        lenses[lensKey] = items.map((label, index) => {
-          const details = itemDetails[label] || {
-            description: `Description for ${label}`,
-            regionHint: 'center'
-          };
-          return {
-            id: `${lensKey}-${index}`,
-            label: label,
-            focusSummary: label,
-            description: details.description,
-            regionHint: details.regionHint || 'center',
-            regionHintCoords: parseRegionHint(details.regionHint || 'center'),
-            confidence: 'medium',
-            salience: 3
-          };
-        });
-        
-        lensOrder.push(lensKey);
-        lensLabels[lensKey] = name;
-        lensDescriptions[lensKey] = description;
-      }
-      
-      result = {
-        altText: data.altText || 'Image description unavailable',
-        imageText: data.imageText || [],
-        imageUrl: imageUrl,
-        imageType: data.imageType || 'unknown',
-        taskHint: data.taskHint || 'general',
-        lenses: lensOrder.map(key => ({
-          id: key,
-          label: lensLabels[key],
-          items: lenses[key] || []
-        }))
-      };
-    } else {
-      // Fallback
-      result = {
-        altText: data.altText || 'Image description unavailable',
-        imageText: data.imageText || [],
-        imageUrl: imageUrl,
-        imageType: 'unknown',
-        taskHint: 'general',
-        lenses: []
-      };
-    }
-    
-    // Update lens configuration from result
-    lensOrder = result.lenses.map(l => l.id);
-    lensLabels = {};
-    lensDescriptions = {};
-    result.lenses.forEach(lens => {
-      lensLabels[lens.id] = lens.label;
-      lensDescriptions[lens.id] = lens.label; // Use label as description if not provided
-    });
-    
-    // Apply predictive ordering
-    result = predictiveOrderer.reorderResult(result);
-    
-    console.log('[Image Rotor] Transformed data:', {
-      altText: result.altText.substring(0, 50),
-      imageType: result.imageType,
-      taskHint: result.taskHint,
-      lensCount: result.lenses.length,
-      lensNames: result.lenses.map(l => l.label)
-    });
-    
-    return result;
+  function subscribeToAnalysis(analysis, listener) {
+    analysis.events.forEach(listener);
+    analysis.listeners.add(listener);
+    return () => analysis.listeners.delete(listener);
+  }
+
+  function transformItem(item) {
+    return {
+      id: item.id,
+      label: item.label,
+      focusSummary: item.focusSummary || item.label,
+      description: item.description || `Description for ${item.label}`,
+      regionHint: item.regionHint || 'center',
+      regionHintCoords: item.regionHintCoords || parseRegionHint(item.regionHint || 'center'),
+      confidence: item.confidence || 'medium',
+      evidence: item.evidence,
+      salience: item.salience || 3,
+      subItems: Array.isArray(item.subItems) && item.subItems.length > 0 ? item.subItems.map(transformItem) : undefined
+    };
   }
 
   function parseRegionHint(hint) {
@@ -645,30 +617,6 @@
       'far': { x: 70, y: 5, width: 25, height: 40 }
     };
     return hints[hint?.toLowerCase()] || { x: 35, y: 35, width: 30, height: 30 };
-  }
-
-  function createFallbackData(imageUrl, altText) {
-    // Reset to default lenses for fallback
-    lensOrder = ['objects', 'layout', 'style'];
-    lensLabels = { objects: 'Objects', layout: 'Layout', style: 'Style' };
-    lensDescriptions = { 
-    objects: 'Physical things in the image',
-    layout: 'Spatial organization',
-    style: 'Visual qualities'
-  };
-
-    return {
-      altText: altText || 'Image description unavailable',
-      imageText: [],
-      imageUrl: imageUrl,
-      imageType: 'unknown',
-      taskHint: 'general',
-      lenses: [
-        { id: 'objects', label: 'Objects', items: [] },
-        { id: 'layout', label: 'Layout', items: [] },
-        { id: 'style', label: 'Style', items: [] }
-      ]
-    };
   }
 
   function updateSpeakingIndicator(speaking) {
@@ -694,17 +642,128 @@
     }
   }
 
-  function updateLoadingState(loading) {
-    if (!rotorPanel) return;
-    
-    const altTextEl = rotorPanel.querySelector('.ir-alt-text');
+  function showAltText(panel, altText) {
+    panel.imageData.altText = altText;
+    const altTextEl = panel.querySelector('.ir-alt-text');
     if (altTextEl) {
-      if (loading) {
-        altTextEl.textContent = 'Analyzing image...';
-        altTextEl.style.opacity = '0.6';
-      } else {
-        altTextEl.style.opacity = '1';
+      altTextEl.textContent = altText;
+      altTextEl.style.opacity = '1';
+    }
+    // Announce and speak alt text (once)
+    if (!hasSpokenAltText) {
+      announce(altText);
+      ttsManager.speak(altText, { interrupt: false, debounceMs: 0 });
+      hasSpokenAltText = true;
+    }
+  }
+
+  function getErrorMessage(event) {
+    if (event.errorType === 'ImageAccess') {
+      return `Cannot access image. The image may be blocked by CORS or require authentication. Try right-clicking the image and selecting "Analyze with Image Rotor" instead.`;
+    } else if (event.errorType === 'Network') {
+      return `Network error. Make sure the server is running at ${API_BASE_URL} and check your internet connection.`;
+    } else if (event.errorType === 'Configuration') {
+      return `Server configuration error: ${event.message}`;
+    } else if (event.errorType === 'RateLimit') {
+      return `OpenAI API rate limit exceeded. Please try again in a few moments.`;
+    }
+    return `Error: ${event.message}`;
+  }
+
+  // Apply one streamed analysis event to the open panel
+  function handleAnalysisEvent(panel, img, event) {
+    if (rotorPanel !== panel) return;
+    const imageData = panel.imageData;
+    const findLens = (id) => imageData.lenses.find(l => l.id === id);
+
+    switch (event.type) {
+      case 'altText':
+        showAltText(panel, event.altText);
+        break;
+
+      case 'altTextError':
+        console.warn('[Image Rotor] Alt-text failed:', event.message);
+        showAltText(panel, img.alt || 'Alt text unavailable');
+        break;
+
+      case 'plan':
+        imageData.imageType = event.imageType || 'unknown';
+        imageData.taskHint = event.taskHint || 'general';
+        imageData.lenses = event.lenses.map(lens => ({ id: lens.id, label: lens.label, items: [], loading: true }));
+        lensOrder = imageData.lenses.map(l => l.id);
+        lensLabels = {};
+        lensDescriptions = {};
+        imageData.lenses.forEach(lens => {
+          lensLabels[lens.id] = lens.label;
+          lensDescriptions[lens.id] = lens.label; // Use label as description if not provided
+        });
+        currentLens = lensOrder[0];
+        focusedIndex = 0;
+        renderItems();
+        break;
+
+      case 'lens': {
+        const lens = findLens(event.lens.id);
+        if (!lens) break;
+        lens.items = predictiveOrderer.reorderLensItems(
+          { id: lens.id, items: event.lens.items.map(transformItem) },
+          imageData.imageType,
+          imageData.taskHint
+        );
+        lens.loading = false;
+        renderItems();
+        // Let the user know if they were waiting on this lens
+        if (lens.id === currentLens && isRotorFocused && !isDrilledDown) {
+          const message = `${lens.items.length} ${lens.label} items loaded`;
+          announce(message);
+          ttsManager.speak(message, { interrupt: false, debounceMs: 0 });
+        }
+        break;
       }
+
+      case 'lensError': {
+        console.warn('[Image Rotor] Lens failed:', event.id, event.message);
+        const lens = findLens(event.id);
+        if (!lens) break;
+        lens.loading = false;
+        lens.failed = true;
+        renderItems();
+        break;
+      }
+
+      case 'imageText':
+        imageData.imageText = event.imageText || [];
+        break;
+
+      case 'error': {
+        console.error('[Image Rotor] Analysis failed:', event);
+        const message = getErrorMessage(event);
+        panel.analysisError = message;
+        imageData.lenses.forEach(lens => {
+          if (lens.loading) {
+            lens.loading = false;
+            lens.failed = true;
+          }
+        });
+        if (!imageData.altText) {
+          const altTextEl = panel.querySelector('.ir-alt-text');
+          if (altTextEl) {
+            altTextEl.textContent = message;
+            altTextEl.style.color = '#ef4444';
+            altTextEl.style.opacity = '1';
+          }
+        }
+        announce(message);
+        renderItems();
+        break;
+      }
+
+      case 'done':
+        console.log('[Image Rotor] Analysis complete:', {
+          imageType: imageData.imageType,
+          lensNames: imageData.lenses.map(l => l.label)
+        });
+        break;
     }
   }
 
@@ -724,10 +783,6 @@
     removeRotorPanel();
     currentImage = img;
     hasSpokenAltText = false;
-
-    // Show loading state
-    isLoading = true;
-    updateLoadingState(true);
 
     // Create panel with loading state
     const panel = document.createElement('div');
@@ -856,54 +911,28 @@
     // Attach event listeners
     attachPanelListeners(panel);
 
-    // Load image data from API
-    console.log('[Image Rotor] Starting API call to describe image...');
-    try {
-      const imageData = await describeImage(img);
-      console.log('[Image Rotor] API call successful, received data:', {
-        altText: imageData.altText?.substring(0, 50),
-        imageType: imageData.imageType,
-        taskHint: imageData.taskHint,
-        lensCount: imageData.lenses?.length || 0,
-        hasText: imageData.imageText?.length > 0
-      });
-      
-    panel.imageData = imageData;
+    // Stream image data from the API; the panel fills in as each part arrives
+    console.log('[Image Rotor] Starting analysis...');
+    panel.imageData = {
+      altText: null,
+      imageText: [],
+      imageUrl: imageUrl,
+      imageType: 'unknown',
+      taskHint: 'general',
+      lenses: []
+    };
+    lensOrder = [];
+    lensLabels = {};
+    lensDescriptions = {};
+    currentLens = null;
+    focusedIndex = 0;
+    isDrilledDown = false;
+    drillDownStack = [];
+    renderItems();
 
-      // Set current lens to first available lens
-      if (lensOrder.length > 0) {
-        currentLens = lensOrder[0];
-        focusedIndex = 0;
-      }
-      
-      // Update alt text
-      const altTextEl = panel.querySelector('.ir-alt-text');
-      if (altTextEl) {
-        altTextEl.textContent = imageData.altText;
-      }
-      
-      // Update lens UI with dynamic data
-      updateLensUI();
-      
-      // Render items
-      renderItems();
-      
-      // Announce and speak alt text (once)
-      if (!hasSpokenAltText && imageData.altText) {
-    announce(imageData.altText);
-        ttsManager.speak(imageData.altText, { interrupt: false, debounceMs: 0 });
-        hasSpokenAltText = true;
-      }
-    } catch (error) {
-      console.error('[Image Rotor] Failed to load image data:', error);
-      console.error('[Image Rotor] Error stack:', error.stack);
-      // Panel already created, just show error state
-      const altTextEl = panel.querySelector('.ir-alt-text');
-      if (altTextEl) {
-        altTextEl.textContent = `Error: ${error.message}`;
-        altTextEl.style.color = '#ef4444';
-      }
-    }
+    const analysis = getAnalysis(img);
+    panel.analysis = analysis;
+    panel.unsubscribe = subscribeToAnalysis(analysis, (event) => handleAnalysisEvent(panel, img, event));
 
     // Focus the panel
     panel.focus();
@@ -937,7 +966,8 @@
     const imageData = rotorPanel.imageData;
     let items = [];
     let breadcrumbText = '';
-    
+    let currentLensObj = null;
+
     if (isDrilledDown && drillDownStack.length > 0) {
       // Show sub-items of the most recent parent
       const parentState = drillDownStack[drillDownStack.length - 1];
@@ -945,7 +975,7 @@
       breadcrumbText = `Details of: ${parentState.item.label}`;
     } else {
       // Show regular items
-      const currentLensObj = imageData.lenses?.find(l => l.id === currentLens);
+      currentLensObj = imageData.lenses?.find(l => l.id === currentLens);
       items = currentLensObj?.items || [];
       breadcrumbText = '';
     }
@@ -1028,11 +1058,19 @@
     `;
     }).join('');
     
-    const lensName = lensLabels[currentLens] || currentLens;
+    const lensName = (lensLabels[currentLens] || currentLens || '').toLowerCase();
     const currentPosition = items.length > 0 ? focusedIndex + 1 : 0;
-    countEl.textContent = items.length > 0 
-      ? `${currentPosition} of ${items.length} in ${lensName.toLowerCase()}`
-      : `No items in ${lensName.toLowerCase()}`;
+    if (!currentLens) {
+      countEl.textContent = rotorPanel.analysisError || 'Analyzing image...';
+    } else if (items.length > 0) {
+      countEl.textContent = `${currentPosition} of ${items.length} in ${lensName}`;
+    } else if (currentLensObj?.loading) {
+      countEl.textContent = `Loading ${lensName}...`;
+    } else if (currentLensObj?.failed) {
+      countEl.textContent = `Could not load ${lensName}`;
+    } else {
+      countEl.textContent = `No items in ${lensName}`;
+    }
     
     // Update lens UI
     updateLensUI();
@@ -1144,12 +1182,12 @@
     
     // Lens label speech: Only speak once per lens switch (context anchor)
     if (lastLensSpoken !== currentLens) {
-      const lensAnnouncement = `${lensName}`;
+      const lensAnnouncement = currentLensObj?.loading ? `${lensName}, loading` : `${lensName}`;
       announce(lensAnnouncement);
       ttsManager.speak(lensAnnouncement, { interrupt: true, debounceMs: 0 });
       lastLensSpoken = currentLens;
     }
-    
+
     renderItems();
     
     // Hide detail panel
@@ -1380,12 +1418,34 @@
     const altText = img.alt || 'No alt text';
     const position = `${index + 1} of ${pageImages.length}`;
     announce(`Image ${position}: ${altText}`);
+
+    schedulePrefetch(img);
   }
-  
+
+  // Start analyzing an image once the user rests on it, so the rotor is often ready
+  // by the time they press Enter. Only one unopened prefetch runs at a time.
+  function schedulePrefetch(img) {
+    clearTimeout(prefetchTimer);
+    prefetchTimer = setTimeout(() => {
+      if (!imageNavigationMode || analyses.has(img.src)) return;
+      cancelUnopenedPrefetch();
+      prefetchedAnalysis = getAnalysis(img);
+    }, PREFETCH_DELAY_MS);
+  }
+
+  function cancelUnopenedPrefetch() {
+    clearTimeout(prefetchTimer);
+    if (prefetchedAnalysis && prefetchedAnalysis.listeners.size === 0) {
+      cancelAnalysis(prefetchedAnalysis);
+    }
+    prefetchedAnalysis = null;
+  }
+
   function stopImageNavigation() {
     imageNavigationMode = false;
     focusedImageIndex = -1;
-    
+    cancelUnopenedPrefetch();
+
     if (imageHighlightOverlay) {
       imageHighlightOverlay.style.display = 'none';
     }
@@ -1556,7 +1616,9 @@
       if (btn) {
         const index = parseInt(btn.dataset.index);
           const currentLensObj = panel.imageData?.lenses?.find(l => l.id === currentLens);
-          const items = currentLensObj?.items || [];
+          const items = isDrilledDown && drillDownStack.length > 0
+            ? drillDownStack[drillDownStack.length - 1].item.subItems || []
+            : currentLensObj?.items || [];
         focusedIndex = index;
         selectItem(items[index]);
       }
@@ -1571,19 +1633,25 @@
   function handleKeyDown(e) {
     if (!rotorPanel) return;
     
-    // Get current items from lenses array
+    // Get current items from lenses array (or the sub-items being viewed)
     const currentLensObj = rotorPanel.imageData?.lenses?.find(l => l.id === currentLens);
-    const items = currentLensObj?.items || [];
-    
+    const items = isDrilledDown && drillDownStack.length > 0
+      ? drillDownStack[drillDownStack.length - 1].item.subItems || []
+      : currentLensObj?.items || [];
+
     // R toggles rotor focus
     if (e.key.toLowerCase() === 'r' && !e.ctrlKey && !e.metaKey && !e.altKey) {
       e.preventDefault();
       isRotorFocused = !isRotorFocused;
       if (isRotorFocused) {
         const lensName = currentLens && lensLabels[currentLens] ? lensLabels[currentLens] : 'Current';
+        if (!currentLens) {
+          announce('Still analyzing image');
+          ttsManager.speak('Still analyzing image', { interrupt: true, debounceMs: 0 });
+        }
         // Speak lens label once as context anchor
         if (lastLensSpoken !== currentLens) {
-          const lensAnnouncement = `${lensName}`;
+          const lensAnnouncement = currentLensObj?.loading ? `${lensName}, loading` : `${lensName}`;
           announce(lensAnnouncement);
           ttsManager.speak(lensAnnouncement, { interrupt: true, debounceMs: 0 });
           lastLensSpoken = currentLens;
@@ -1753,6 +1821,11 @@
     if (rotorPanel) {
       document.removeEventListener('keydown', handleKeyDown);
       ttsManager.stop();
+      // Stop paying for an analysis nobody is waiting on
+      rotorPanel.unsubscribe?.();
+      if (rotorPanel.analysis?.listeners.size === 0) {
+        cancelAnalysis(rotorPanel.analysis);
+      }
       rotorPanel.remove();
       rotorPanel = null;
       selectedItem = null;

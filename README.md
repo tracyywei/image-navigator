@@ -126,30 +126,24 @@ Analyzes an image using OpenAI Vision API.
 }
 ```
 
-**Response:**
+**Response:** a stream of newline-delimited JSON events (`application/x-ndjson`), sent as each part of the analysis finishes:
+
 ```json
-{
-  "altText": "Description of the image",
-  "imageText": ["Text found in image"],
-  "lenses": {
-    "objects": ["Item 1", "Item 2"],
-    "layout": ["Layout element 1"],
-    "style": ["Style element 1"]
-  },
-  "itemDetails": {
-    "Item 1": {
-      "description": "Detailed description",
-      "regionHint": { "x": 10, "y": 20, "width": 30, "height": 40 }
-    }
-  }
-}
+{"type": "plan", "imageType": "street", "taskHint": "skim", "lenses": [{"id": "people", "label": "People"}, {"id": "objects", "label": "Objects"}]}
+{"type": "altText", "altText": "Description of the image"}
+{"type": "imageText", "imageText": ["Text found in image"]}
+{"type": "lens", "lens": {"id": "objects", "label": "Objects", "items": [...]}}
+{"type": "lens", "lens": {"id": "people", "label": "People", "items": [...]}}
+{"type": "done"}
 ```
+
+Failures are reported in the stream as `{"type": "lensError", "id", "message"}` (one lens failed), `{"type": "altTextError", "message"}`, or `{"type": "error", "errorType", "message"}` (the analysis failed). The stream always ends with `done`.
 
 ## Configuration
 
 ### Change API Base URL
 
-Edit `extension/content.js` and update the `API_BASE_URL` constant:
+Edit `extension/background.js` (which makes the requests) and `extension/content.js` (used in error messages), and update the `API_BASE_URL` constant:
 
 ```javascript
 const API_BASE_URL = 'http://localhost:3001';
