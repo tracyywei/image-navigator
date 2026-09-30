@@ -360,27 +360,26 @@ Output JSON:
 
 // Map an error to the errorType/message the extension shows the user
 function classifyError(error) {
-  let errorMessage = error.message || 'Unknown error';
-  let errorType = 'Unknown';
-
-  if (error.message?.includes('API key')) {
-    errorType = 'Configuration';
-    errorMessage = 'OpenAI API key is not configured or invalid';
-  } else if (error.message?.includes('fetch') || error.message?.includes('network')) {
-    errorType = 'Network';
-    errorMessage = 'Network error while accessing image or OpenAI API';
-  } else if (error.message?.includes('JSON') || error.message?.includes('parse')) {
-    errorType = 'Parsing';
-    errorMessage = 'Failed to parse response from OpenAI';
-  } else if (error.message?.includes('rate limit') || error.message?.includes('429')) {
-    errorType = 'RateLimit';
-    errorMessage = 'OpenAI API rate limit exceeded. Please try again later.';
-  } else if (error.message?.includes('image') || error.message?.includes('URL')) {
-    errorType = 'ImageAccess';
-    errorMessage = `Cannot access image at URL. The image may require authentication or be blocked. Original error: ${error.message}`;
+  const message = error.message || '';
+  if (message.includes('API key')) {
+    return { errorType: 'Configuration', message: 'OpenAI API key is not configured or invalid' };
   }
-
-  return { errorType, message: errorMessage };
+  if (message.includes('fetch') || message.includes('network')) {
+    return { errorType: 'Network', message: 'Network error while accessing image or OpenAI API' };
+  }
+  if (message.includes('JSON') || message.includes('parse')) {
+    return { errorType: 'Parsing', message: 'Failed to parse response from OpenAI' };
+  }
+  if (message.includes('rate limit') || message.includes('429')) {
+    return { errorType: 'RateLimit', message: 'OpenAI API rate limit exceeded. Please try again later.' };
+  }
+  if (message.includes('image') || message.includes('URL')) {
+    return {
+      errorType: 'ImageAccess',
+      message: `Cannot access image at URL. The image may require authentication or be blocked. Original error: ${message}`
+    };
+  }
+  return { errorType: 'Unknown', message: message || 'Unknown error' };
 }
 
 // API route to describe image. Responds with newline-delimited JSON events so the

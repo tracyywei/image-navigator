@@ -9,26 +9,20 @@
 
   // Configuration
   const API_BASE_URL = 'http://localhost:3001'; // Change this to your backend URL
-  
-  // Test message listener is working
-  console.log('[Image Rotor] Setting up message listener...');
 
   // State
   let isSelectingImage = false;
   let rotorPanel = null;
-  let currentImage = null;
-  let highlightOverlay = null;
   let selectedItem = null;
   let currentLens = null; // Will be set to first lens dynamically
   let focusedIndex = 0;
   let isRotorFocused = false;
   let hasSpokenAltText = false;
   let lastLensSpoken = null; // Track last lens label spoken to avoid repetition
-  let lastSelectedItemId = null; // Track last selected item to avoid re-speaking
-  
+
   // Drill-down navigation state
-  let drillDownStack = []; // Stack of {item, parentItems, focusedIndex} for navigation history
-    let isDrilledDown = false; // Whether we're currently viewing sub-items
+  let drillDownStack = []; // Stack of {item, focusedIndex} for navigation history
+  let isDrilledDown = false; // Whether we're currently viewing sub-items
   
   // Image navigation state
   let imageNavigationMode = false;
@@ -42,37 +36,26 @@
   // Lens configuration - will be populated dynamically from API response
   let lensOrder = [];
   let lensLabels = {};
-  let lensDescriptions = {};
 
-  // Enhanced TTS Manager (inline - matches tts-manager.js)
   class EnhancedTTSManager {
     constructor() {
       this.isSupported = typeof window !== 'undefined' && 'speechSynthesis' in window;
       this.isSpeaking = false;
       this.lastSpokenText = null;
-      this.currentUtterance = null;
       this.focusDebounceTimer = null;
       this.focusDebounceDelay = 175;
       this.lastFocusedText = null;
       this.lastSpokenTime = 0;
       this.sameTextThreshold = 1000;
-      this.enabled = true;
       this.rate = 1.0; // Default speed (1.0 = normal, can go up to 2.0)
       this.loadSpeed();
     }
 
     async loadSpeed() {
       try {
-        if (typeof chrome !== 'undefined' && chrome.storage) {
-          const result = await chrome.storage.local.get(['ttsSpeed']);
-          if (result.ttsSpeed !== undefined) {
-            this.rate = Math.max(0.5, Math.min(2.0, parseFloat(result.ttsSpeed) || 1.0));
-          }
-        } else {
-          const stored = localStorage.getItem('imageRotor_ttsSpeed');
-          if (stored) {
-            this.rate = Math.max(0.5, Math.min(2.0, parseFloat(stored) || 1.0));
-          }
+        const result = await chrome.storage.local.get(['ttsSpeed']);
+        if (result.ttsSpeed !== undefined) {
+          this.rate = Math.max(0.5, Math.min(2.0, parseFloat(result.ttsSpeed) || 1.0));
         }
       } catch (error) {
         console.warn('[TTS Manager] Failed to load speed:', error);
@@ -82,11 +65,7 @@
     async setSpeed(rate) {
       this.rate = Math.max(0.5, Math.min(2.0, parseFloat(rate) || 1.0));
       try {
-        if (typeof chrome !== 'undefined' && chrome.storage) {
-          await chrome.storage.local.set({ ttsSpeed: this.rate });
-        } else {
-          localStorage.setItem('imageRotor_ttsSpeed', String(this.rate));
-        }
+        await chrome.storage.local.set({ ttsSpeed: this.rate });
         updateSpeedIndicator(this.rate);
       } catch (error) {
         console.warn('[TTS Manager] Failed to save speed:', error);
@@ -105,13 +84,8 @@
       announce(`Voice speed ${(newRate * 100).toFixed(0)}%`);
     }
 
-    setEnabled(enabled) {
-      this.enabled = enabled;
-      if (!enabled) this.stop();
-    }
-
     speak(text, options = {}) {
-      if (!this.isSupported || !this.enabled || !text || text.trim().length === 0) {
+      if (!this.isSupported || !text || text.trim().length === 0) {
         return;
       }
 
@@ -139,21 +113,13 @@
 
         utterance.onstart = () => {
           this.isSpeaking = true;
-          this.currentUtterance = utterance;
           this.lastSpokenText = text;
           this.lastSpokenTime = Date.now();
           updateSpeakingIndicator(true);
         };
 
-        utterance.onend = () => {
+        utterance.onend = utterance.onerror = () => {
           this.isSpeaking = false;
-          this.currentUtterance = null;
-          updateSpeakingIndicator(false);
-        };
-
-        utterance.onerror = () => {
-          this.isSpeaking = false;
-          this.currentUtterance = null;
           updateSpeakingIndicator(false);
         };
 
@@ -188,12 +154,7 @@
         this.focusDebounceTimer = null;
       }
       this.isSpeaking = false;
-      this.currentUtterance = null;
       updateSpeakingIndicator(false);
-    }
-
-    getLastSpoken() {
-      return this.lastSpokenText;
     }
 
     replayLast() {
@@ -205,7 +166,6 @@
 
   const ttsManager = new EnhancedTTSManager();
 
-  // Predictive Orderer (inline - matches predictive-ordering.js)
   class PredictiveOrderer {
     constructor() {
       this.storageKey = 'imageRotor_usageStats';
@@ -220,16 +180,9 @@
 
     async loadSettings() {
       try {
-        if (typeof chrome !== 'undefined' && chrome.storage) {
-          const result = await chrome.storage.local.get(['predictiveOrdering', this.storageKey]);
-          this.enabled = result.predictiveOrdering !== false;
-          this.usageStats = result[this.storageKey] || this.usageStats;
-        } else {
-          const stored = localStorage.getItem('imageRotor_predictiveOrdering');
-          this.enabled = stored !== 'false';
-          const stats = localStorage.getItem(this.storageKey);
-          this.usageStats = stats ? JSON.parse(stats) : this.usageStats;
-        }
+        const result = await chrome.storage.local.get(['predictiveOrdering', this.storageKey]);
+        this.enabled = result.predictiveOrdering !== false;
+        this.usageStats = result[this.storageKey] || this.usageStats;
       } catch (error) {
         console.warn('[Predictive Orderer] Failed to load:', error);
       }
@@ -237,25 +190,17 @@
 
     async saveSettings() {
       try {
-        if (typeof chrome !== 'undefined' && chrome.storage) {
-          await chrome.storage.local.set({
-            predictiveOrdering: this.enabled,
-            [this.storageKey]: this.usageStats
-          });
-        } else {
-          localStorage.setItem('imageRotor_predictiveOrdering', String(this.enabled));
-          localStorage.setItem(this.storageKey, JSON.stringify(this.usageStats));
-        }
+        await chrome.storage.local.set({
+          predictiveOrdering: this.enabled,
+          [this.storageKey]: this.usageStats
+        });
       } catch (error) {
         console.warn('[Predictive Orderer] Failed to save:', error);
       }
     }
 
-    recordSelection(itemId, imageType, taskHint) {
-      if (!this.usageStats.clickCountByItemId[itemId]) {
-        this.usageStats.clickCountByItemId[itemId] = 0;
-      }
-      this.usageStats.clickCountByItemId[itemId]++;
+    recordSelection(itemId) {
+      this.usageStats.clickCountByItemId[itemId] = (this.usageStats.clickCountByItemId[itemId] || 0) + 1;
       this.usageStats.lastSelectedTimestamps[itemId] = Date.now();
       this.saveSettings();
     }
@@ -287,8 +232,7 @@
 
     reorderLensItems(lens, imageType, taskHint) {
       if (!this.enabled) return lens.items;
-      const items = [...lens.items];
-      const scoredItems = items.map(item => {
+      const scoredItems = lens.items.map(item => {
         const clickCount = this.usageStats.clickCountByItemId[item.id] || 0;
         const lastSelected = this.usageStats.lastSelectedTimestamps[item.id];
         const finalScore =
@@ -300,15 +244,6 @@
       });
       scoredItems.sort((a, b) => b.score - a.score);
       return scoredItems.map(s => s.item);
-    }
-
-    reorderResult(result) {
-      if (!this.enabled || !result.lenses) return result;
-      const reorderedLenses = result.lenses.map(lens => ({
-        ...lens,
-        items: this.reorderLensItems(lens, result.imageType, result.taskHint)
-      }));
-      return { ...result, lenses: reorderedLenses };
     }
   }
 
@@ -370,21 +305,11 @@
   function getImageContext(img) {
     const context = [];
     
-    // Helper to clean and extract text from element
+    // Text content of an element, excluding script/style/noscript, with whitespace collapsed
     const extractText = (element) => {
-      if (!element) return '';
-      
-      // Get text content but exclude script, style, and hidden elements
-      let clone = element.cloneNode(true);
-      let scripts = clone.querySelectorAll('script, style, noscript');
-      scripts.forEach(s => s.remove());
-      
-      let text = clone.textContent?.trim() || '';
-      
-      // Remove excessive whitespace
-      text = text.replace(/\s+/g, ' ').trim();
-      
-      return text;
+      const clone = element.cloneNode(true);
+      clone.querySelectorAll('script, style, noscript').forEach(s => s.remove());
+      return clone.textContent.replace(/\s+/g, ' ').trim();
     };
     
     // 1. Check for figure/figcaption (common HTML5 pattern)
@@ -393,7 +318,7 @@
       const figcaption = figure.querySelector('figcaption');
       if (figcaption) {
         const captionText = extractText(figcaption);
-        if (captionText && captionText.length > 0) {
+        if (captionText) {
           context.push(`[Caption: ${captionText}]`);
         }
       }
@@ -408,14 +333,13 @@
       '.image-caption'
     ];
     
-    let captionElement = null;
     const parent = img.parentElement;
     if (parent) {
       for (const selector of captionSelectors) {
-        captionElement = parent.querySelector(selector);
+        const captionElement = parent.querySelector(selector);
         if (captionElement) {
           const captionText = extractText(captionElement);
-          if (captionText && captionText.length > 0 && captionText.length < 300) {
+          if (captionText && captionText.length < 300) {
             context.push(`[Caption: ${captionText}]`);
             break;
           }
@@ -438,7 +362,7 @@
           // Check if it's a paragraph or text-containing block element
           if (sibling.matches('p, div[class*="text"], div[class*="paragraph"], blockquote, li')) {
             const text = extractText(sibling);
-            if (text && text.length > 20 && text.length < 400) {
+            if (text.length > 20 && text.length < 400) {
               return text;
             }
           }
@@ -470,7 +394,7 @@
       const altText = img.alt || '';
       const filteredText = parentText.replace(altText, '').trim();
       
-      if (filteredText && filteredText.length > 10 && filteredText.length < 500) {
+      if (filteredText.length > 10 && filteredText.length < 500) {
         context.push(filteredText);
       }
     }
@@ -658,16 +582,18 @@
   }
 
   function getErrorMessage(event) {
-    if (event.errorType === 'ImageAccess') {
-      return `Cannot access image. The image may be blocked by CORS or require authentication. Try right-clicking the image and selecting "Analyze with Image Rotor" instead.`;
-    } else if (event.errorType === 'Network') {
-      return `Network error. Make sure the server is running at ${API_BASE_URL} and check your internet connection.`;
-    } else if (event.errorType === 'Configuration') {
-      return `Server configuration error: ${event.message}`;
-    } else if (event.errorType === 'RateLimit') {
-      return `OpenAI API rate limit exceeded. Please try again in a few moments.`;
+    switch (event.errorType) {
+      case 'ImageAccess':
+        return `Cannot access image. The image may be blocked by CORS or require authentication. Try right-clicking the image and selecting "Analyze with Image Rotor" instead.`;
+      case 'Network':
+        return `Network error. Make sure the server is running at ${API_BASE_URL} and check your internet connection.`;
+      case 'Configuration':
+        return `Server configuration error: ${event.message}`;
+      case 'RateLimit':
+        return `OpenAI API rate limit exceeded. Please try again in a few moments.`;
+      default:
+        return `Error: ${event.message}`;
     }
-    return `Error: ${event.message}`;
   }
 
   // Apply one streamed analysis event to the open panel
@@ -691,12 +617,7 @@
         imageData.taskHint = event.taskHint || 'general';
         imageData.lenses = event.lenses.map(lens => ({ id: lens.id, label: lens.label, items: [], loading: true }));
         lensOrder = imageData.lenses.map(l => l.id);
-        lensLabels = {};
-        lensDescriptions = {};
-        imageData.lenses.forEach(lens => {
-          lensLabels[lens.id] = lens.label;
-          lensDescriptions[lens.id] = lens.label; // Use label as description if not provided
-        });
+        lensLabels = Object.fromEntries(imageData.lenses.map(l => [l.id, l.label]));
         currentLens = lensOrder[0];
         focusedIndex = 0;
         renderItems();
@@ -769,19 +690,14 @@
 
   // Create the rotor panel UI
   async function createRotorPanel(img) {
-    if (!img) {
-      console.error('[Image Rotor] createRotorPanel called with undefined/null image');
-      return;
-    }
-    const imageUrl = img.src || (img.isVirtual ? img.src : null);
+    const imageUrl = img.src;
     if (!imageUrl) {
       console.error('[Image Rotor] Image has no src property:', img);
       announce('Cannot analyze image: no image source available');
       return;
     }
-    console.log('[Image Rotor] createRotorPanel called for image:', imageUrl?.substring(0, 100));
+    console.log('[Image Rotor] createRotorPanel called for image:', imageUrl.substring(0, 100));
     removeRotorPanel();
-    currentImage = img;
     hasSpokenAltText = false;
 
     // Create panel with loading state
@@ -923,7 +839,6 @@
     };
     lensOrder = [];
     lensLabels = {};
-    lensDescriptions = {};
     currentLens = null;
     focusedIndex = 0;
     isDrilledDown = false;
@@ -938,6 +853,38 @@
     panel.focus();
   }
 
+  function getCurrentLens() {
+    return rotorPanel?.imageData?.lenses.find(l => l.id === currentLens);
+  }
+
+  // Items currently listed: the open lens, or the sub-items being viewed
+  function getVisibleItems() {
+    if (isDrilledDown && drillDownStack.length > 0) {
+      return drillDownStack[drillDownStack.length - 1].item.subItems || [];
+    }
+    return getCurrentLens()?.items || [];
+  }
+
+  function isUncertain(item) {
+    return item.confidence === 'low' || item.confidence === 'medium';
+  }
+
+  // Navigation speaks labels only, with a cue when the item is uncertain
+  function speakItemLabel(item) {
+    let label = item.label;
+    if (isUncertain(item) && !label.includes('(likely)')) {
+      label = `${label}. Likely inferred.`;
+    }
+    announce(label);
+    ttsManager.speakDebounced(label);
+  }
+
+  function hideDetail() {
+    rotorPanel.querySelector('.ir-detail-empty').style.display = 'block';
+    rotorPanel.querySelector('.ir-detail-content').style.display = 'none';
+    rotorPanel.querySelector('.ir-region-overlay').style.display = 'none';
+  }
+
   function updateLensUI() {
     if (!rotorPanel) return;
     
@@ -949,8 +896,8 @@
       lensLabelEl.textContent = lensLabels[currentLens];
     }
     
-    if (lensDescEl && currentLens && lensDescriptions[currentLens]) {
-      lensDescEl.textContent = lensDescriptions[currentLens];
+    if (lensDescEl && currentLens && lensLabels[currentLens]) {
+      lensDescEl.textContent = lensLabels[currentLens];
     }
     
     if (lensIndicatorsEl && lensOrder.length > 0) {
@@ -963,22 +910,11 @@
   function renderItems() {
     if (!rotorPanel || !rotorPanel.imageData) return;
     
-    const imageData = rotorPanel.imageData;
-    let items = [];
-    let breadcrumbText = '';
-    let currentLensObj = null;
-
-    if (isDrilledDown && drillDownStack.length > 0) {
-      // Show sub-items of the most recent parent
-      const parentState = drillDownStack[drillDownStack.length - 1];
-      items = parentState.item.subItems || [];
-      breadcrumbText = `Details of: ${parentState.item.label}`;
-    } else {
-      // Show regular items
-      currentLensObj = imageData.lenses?.find(l => l.id === currentLens);
-      items = currentLensObj?.items || [];
-      breadcrumbText = '';
-    }
+    const items = getVisibleItems();
+    const currentLensObj = getCurrentLens();
+    const breadcrumbText = isDrilledDown && drillDownStack.length > 0
+      ? `Details of: ${drillDownStack[drillDownStack.length - 1].item.label}`
+      : '';
     
     const listEl = rotorPanel.querySelector('.ir-items-list');
     const countEl = rotorPanel.querySelector('.ir-items-count');
@@ -1002,36 +938,28 @@
       const confidenceClass = item.confidence === 'low' ? 'ir-low-confidence' : 
                              item.confidence === 'medium' ? 'ir-medium-confidence' : '';
       
-      // Add uncertainty marker to label for low/medium confidence
+      // Add (likely) suffix for uncertain items
       let displayLabel = item.label;
-      if (item.confidence === 'low' || item.confidence === 'medium') {
-        // Add (likely) suffix for uncertain items
-        if (!displayLabel.includes('(likely)') && !displayLabel.startsWith('~')) {
-          displayLabel = `${displayLabel} (likely)`;
-        }
+      if (isUncertain(item) && !displayLabel.includes('(likely)') && !displayLabel.startsWith('~')) {
+        displayLabel = `${displayLabel} (likely)`;
       }
       
-      // Include focusSummary in aria-label for better screen reader skimming
-      // For text items, prioritize showing the actual text content
+      // Include focusSummary in aria-label for better screen reader skimming.
+      // For text items, lead with the quoted text itself.
       let ariaLabel = displayLabel;
       if (item.focusSummary) {
-        // For text lens, include the actual text prominently
-        if (currentLens === 'text' && item.label.includes("'")) {
-          const textMatch = item.label.match(/'([^']+)'/);
-          if (textMatch) {
-            ariaLabel = `Text: ${textMatch[1]}. ${item.focusSummary}`;
-          } else {
-            ariaLabel = `${displayLabel}. ${item.focusSummary}`;
-          }
-        } else {
-          ariaLabel = `${displayLabel}. ${item.focusSummary}`;
-        }
+        const textMatch = currentLens === 'text' && item.label.match(/'([^']+)'/);
+        ariaLabel = textMatch
+          ? `Text: ${textMatch[1]}. ${item.focusSummary}`
+          : `${displayLabel}. ${item.focusSummary}`;
       }
-      // Add uncertainty audio cue for low/medium confidence (only in aria-label, not spoken separately)
-      if ((item.confidence === 'low' || item.confidence === 'medium') && !ariaLabel.includes('Likely inferred')) {
+      // Uncertainty cue for screen readers (only in aria-label, not spoken separately)
+      if (isUncertain(item) && !ariaLabel.includes('Likely inferred')) {
         ariaLabel = `${ariaLabel}. Likely inferred.`;
       }
       ariaLabel = escapeHtml(ariaLabel);
+      const textPreview = currentLens === 'text' &&
+        (item.label.match(/'([^']+)'/) || item.focusSummary?.match(/'([^']+)'/));
       
       return `
       <li class="ir-item-wrapper">
@@ -1048,10 +976,7 @@
           <span class="ir-item-content">
             <span class="ir-item-label">${escapeHtml(displayLabel)}</span>
             ${item.focusSummary ? `<span class="ir-item-summary" aria-hidden="true">${escapeHtml(item.focusSummary)}</span>` : ''}
-            ${currentLens === 'text' && (item.label.includes("'") || item.focusSummary?.includes("'")) ? (() => {
-              const textMatch = item.label.match(/'([^']+)'/) || item.focusSummary?.match(/'([^']+)'/);
-              return textMatch ? `<span class="ir-item-text-preview" aria-hidden="true">${escapeHtml(textMatch[1])}</span>` : '';
-            })() : ''}
+            ${textPreview ? `<span class="ir-item-text-preview" aria-hidden="true">${escapeHtml(textPreview[1])}</span>` : ''}
           </span>
         </button>
       </li>
@@ -1093,62 +1018,35 @@
 
   function selectItem(item) {
     selectedItem = item;
-    
-    // Record selection for predictive ordering
-    if (item && rotorPanel?.imageData) {
-      predictiveOrderer.recordSelection(
-        item.id,
-        rotorPanel.imageData.imageType,
-        rotorPanel.imageData.taskHint
-      );
+    if (!item) {
+      hideDetail();
+      renderItems();
+      return;
     }
-    
-    const detailEmpty = rotorPanel.querySelector('.ir-detail-empty');
-    const detailContent = rotorPanel.querySelector('.ir-detail-content');
-    
-    if (item) {
-      if (detailEmpty) detailEmpty.style.display = 'none';
-      if (detailContent) detailContent.style.display = 'block';
-      
-      const titleEl = rotorPanel.querySelector('.ir-detail-title');
-      const descEl = rotorPanel.querySelector('.ir-detail-description');
-      
-      if (titleEl) titleEl.textContent = item.label;
-      if (descEl) descEl.textContent = item.description;
-      
-      // Show region overlay (only for parent items, not sub-items)
-      if (!isDrilledDown) {
-        const coords = item.regionHintCoords || parseRegionHint(item.regionHint);
-        if (coords) {
-        const overlay = rotorPanel.querySelector('.ir-region-overlay');
-          if (overlay) {
-        overlay.style.display = 'block';
-            overlay.style.left = `${coords.x}%`;
-            overlay.style.top = `${coords.y}%`;
-            overlay.style.width = `${coords.width}%`;
-            overlay.style.height = `${coords.height}%`;
-          }
-      } else {
-          const overlay = rotorPanel.querySelector('.ir-region-overlay');
-          if (overlay) overlay.style.display = 'none';
-        }
-      } else {
-        // Hide overlay when viewing sub-items
-        const overlay = rotorPanel.querySelector('.ir-region-overlay');
-        if (overlay) overlay.style.display = 'none';
-      }
-      
-      // Audio: Speak description on selection (can be re-read with second Enter)
-      ttsManager.speak(item.description, { interrupt: true, debounceMs: 0 });
-      announce(item.description);
-      lastSelectedItemId = item.id;
+
+    predictiveOrderer.recordSelection(item.id);
+
+    rotorPanel.querySelector('.ir-detail-empty').style.display = 'none';
+    rotorPanel.querySelector('.ir-detail-content').style.display = 'block';
+    rotorPanel.querySelector('.ir-detail-title').textContent = item.label;
+    rotorPanel.querySelector('.ir-detail-description').textContent = item.description;
+
+    // Show region overlay (only for parent items, not sub-items)
+    const overlay = rotorPanel.querySelector('.ir-region-overlay');
+    if (isDrilledDown) {
+      overlay.style.display = 'none';
     } else {
-      if (detailEmpty) detailEmpty.style.display = 'block';
-      if (detailContent) detailContent.style.display = 'none';
-      const overlay = rotorPanel.querySelector('.ir-region-overlay');
-      if (overlay) overlay.style.display = 'none';
+      const coords = item.regionHintCoords || parseRegionHint(item.regionHint);
+      overlay.style.display = 'block';
+      overlay.style.left = `${coords.x}%`;
+      overlay.style.top = `${coords.y}%`;
+      overlay.style.width = `${coords.width}%`;
+      overlay.style.height = `${coords.height}%`;
     }
-    
+
+    // Speak description on selection (can be re-read with second Enter)
+    ttsManager.speak(item.description, { interrupt: true, debounceMs: 0 });
+    announce(item.description);
     renderItems();
   }
 
@@ -1162,100 +1060,54 @@
     }
     
     const currentIndex = lensOrder.indexOf(currentLens);
-    let newIndex;
-    
-    if (direction === 'left') {
-      newIndex = currentIndex === 0 ? lensOrder.length - 1 : currentIndex - 1;
-    } else {
-      newIndex = currentIndex === lensOrder.length - 1 ? 0 : currentIndex + 1;
-    }
-    
-    currentLens = lensOrder[newIndex];
+    const step = direction === 'left' ? -1 : 1;
+    currentLens = lensOrder[(currentIndex + step + lensOrder.length) % lensOrder.length];
     focusedIndex = 0;
     selectedItem = null;
     drillDownStack = []; // Clear drill-down stack when switching lenses
     
-    // Get items from lenses array
-    const currentLensObj = rotorPanel.imageData.lenses?.find(l => l.id === currentLens);
-    const items = currentLensObj?.items || [];
-    const lensName = lensLabels[currentLens] || currentLens;
-    
     // Lens label speech: Only speak once per lens switch (context anchor)
     if (lastLensSpoken !== currentLens) {
-      const lensAnnouncement = currentLensObj?.loading ? `${lensName}, loading` : `${lensName}`;
+      const lensName = lensLabels[currentLens] || currentLens;
+      const lensAnnouncement = getCurrentLens()?.loading ? `${lensName}, loading` : `${lensName}`;
       announce(lensAnnouncement);
       ttsManager.speak(lensAnnouncement, { interrupt: true, debounceMs: 0 });
       lastLensSpoken = currentLens;
     }
 
     renderItems();
-    
-    // Hide detail panel
-    const detailEmpty = rotorPanel?.querySelector('.ir-detail-empty');
-    const detailContent = rotorPanel?.querySelector('.ir-detail-content');
-    const overlay = rotorPanel?.querySelector('.ir-region-overlay');
-    if (detailEmpty) detailEmpty.style.display = 'block';
-    if (detailContent) detailContent.style.display = 'none';
-    if (overlay) overlay.style.display = 'none';
+    hideDetail();
   }
 
   function drillDown(parentItem) {
-    if (!parentItem || !parentItem.subItems || parentItem.subItems.length === 0) return;
+    if (!parentItem?.subItems?.length) return;
     
-    // Save current state to stack
-    const currentLensObj = rotorPanel.imageData?.lenses?.find(l => l.id === currentLens);
-    const currentItems = currentLensObj?.items || [];
-    drillDownStack.push({
-      item: parentItem,
-      parentItems: currentItems,
-      focusedIndex: focusedIndex
-    });
-    
-    // Switch to sub-items view
+    drillDownStack.push({ item: parentItem, focusedIndex });
     isDrilledDown = true;
     focusedIndex = 0;
     selectedItem = null;
     
-    // Announce drill-down
     const announcement = `Drilled down into ${parentItem.label}. ${parentItem.subItems.length} details available.`;
     announce(announcement);
     ttsManager.speak(announcement, { interrupt: true, debounceMs: 0 });
-    
-    // Render sub-items
     renderItems();
     
     // Speak first sub-item after announcement
-    setTimeout(() => {
-      if (parentItem.subItems.length > 0) {
-        const firstSubItem = parentItem.subItems[0];
-        let labelToSpeak = firstSubItem.label;
-        if ((firstSubItem.confidence === 'low' || firstSubItem.confidence === 'medium') && !labelToSpeak.includes('(likely)')) {
-          labelToSpeak = `${labelToSpeak}. Likely inferred.`;
-        }
-        announce(labelToSpeak);
-        ttsManager.speakDebounced(labelToSpeak);
-      }
-    }, 1000);
+    setTimeout(() => speakItemLabel(parentItem.subItems[0]), 1000);
   }
   
   function drillUp() {
     if (drillDownStack.length === 0) return;
     
-    // Restore previous state
     const previousState = drillDownStack.pop();
     isDrilledDown = false;
     focusedIndex = previousState.focusedIndex;
-    selectedItem = previousState.item;
     
-    // Announce drill-up
     const announcement = `Drilled back up to ${previousState.item.label}`;
     announce(announcement);
     ttsManager.speak(announcement, { interrupt: true, debounceMs: 0 });
     
-    // Render parent items
-    renderItems();
-    
-    // Re-select the parent item
+    // Re-select the parent item (this also re-renders the list)
     selectItem(previousState.item);
   }
 
@@ -1273,9 +1125,7 @@
         document.body.appendChild(liveRegion);
       }
     }
-    if (liveRegion) {
     liveRegion.textContent = message;
-    }
   }
 
 
@@ -1486,60 +1336,40 @@
         }
         break;
         
-      case 'Enter':
+      case 'Enter': {
         e.preventDefault();
         e.stopPropagation();
-        console.log('[Image Rotor] Enter pressed, focusedImageIndex:', focusedImageIndex, 'pageImages.length:', pageImages.length);
-        if (focusedImageIndex >= 0 && focusedImageIndex < pageImages.length) {
-          const imgToAnalyze = pageImages[focusedImageIndex];
-          console.log('[Image Rotor] Image to analyze:', {
-            exists: !!imgToAnalyze,
-            hasSrc: !!(imgToAnalyze && imgToAnalyze.src),
-            inDOM: !!(imgToAnalyze && document.contains(imgToAnalyze)),
-            src: imgToAnalyze ? (imgToAnalyze.src || 'no src') : 'no image'
-          });
-          
-          // Don't stop navigation yet - wait until panel is created
-          
-          if (imgToAnalyze && document.contains(imgToAnalyze)) {
-            // Check if image has src or can get it
-            let imageSrc = imgToAnalyze.src;
-            if (!imageSrc) {
-              // Try to get src from currentSrc or data-src
-              imageSrc = imgToAnalyze.currentSrc || imgToAnalyze.getAttribute('data-src') || imgToAnalyze.getAttribute('srcset')?.split(' ')[0] || '';
-            }
-            
-            if (imageSrc) {
-              console.log('[Image Rotor] Calling createRotorPanel with image:', imageSrc.substring(0, 100));
-              // Ensure image has src before calling
-              if (!imgToAnalyze.src && imageSrc) {
-                imgToAnalyze.src = imageSrc;
-              }
-              
-              // Create panel and then stop navigation
-              createRotorPanel(imgToAnalyze)
-                .then(() => {
-                  console.log('[Image Rotor] Panel created successfully');
-                  stopImageNavigation();
-                })
-                .catch(error => {
-                  console.error('[Image Rotor] Error creating rotor panel:', error);
-                  console.error('[Image Rotor] Error stack:', error.stack);
-                  announce('Error analyzing image: ' + error.message);
-                  stopImageNavigation();
-                });
-            } else {
-              console.error('[Image Rotor] Image has no src property');
-              announce('Cannot analyze image: no image source available');
-              stopImageNavigation();
-            }
-          } else {
-            console.error('[Image Rotor] Image no longer available or not in DOM');
-            announce('Image no longer available');
-            stopImageNavigation();
-          }
+        const imgToAnalyze = pageImages[focusedImageIndex];
+        if (!imgToAnalyze) break;
+
+        if (!document.contains(imgToAnalyze)) {
+          console.error('[Image Rotor] Image no longer available or not in DOM');
+          announce('Image no longer available');
+          stopImageNavigation();
+          break;
         }
+
+        // Fall back to currentSrc, data-src or srcset when src is empty
+        if (!imgToAnalyze.src) {
+          const fallbackSrc = imgToAnalyze.currentSrc || imgToAnalyze.getAttribute('data-src') || imgToAnalyze.getAttribute('srcset')?.split(' ')[0];
+          if (!fallbackSrc) {
+            console.error('[Image Rotor] Image has no src property');
+            announce('Cannot analyze image: no image source available');
+            stopImageNavigation();
+            break;
+          }
+          imgToAnalyze.src = fallbackSrc;
+        }
+
+        createRotorPanel(imgToAnalyze)
+          .then(stopImageNavigation)
+          .catch(error => {
+            console.error('[Image Rotor] Error creating rotor panel:', error);
+            announce('Error analyzing image: ' + error.message);
+            stopImageNavigation();
+          });
         break;
+      }
         
       case 'Escape':
         e.preventDefault();
@@ -1550,80 +1380,43 @@
   }
   function attachPanelListeners(panel) {
     // Close button
-    const closeBtn = panel.querySelector('.ir-close-btn');
-    if (closeBtn) {
-      closeBtn.addEventListener('click', removeRotorPanel);
-    }
+    panel.querySelector('.ir-close-btn').addEventListener('click', removeRotorPanel);
     
     // Speak alt text button
-    const speakBtn = panel.querySelector('.ir-speak-btn');
-    if (speakBtn) {
-      speakBtn.addEventListener('click', () => {
-        if (panel.imageData?.altText) {
-          ttsManager.replayLast();
-        }
-      });
-    }
+    panel.querySelector('.ir-speak-btn').addEventListener('click', () => {
+      if (panel.imageData?.altText) {
+        ttsManager.replayLast();
+      }
+    });
     
-    // Speed control button - cycles through speeds and increases speed
-    const speedBtn = panel.querySelector('.ir-speed-btn');
-    if (speedBtn) {
-      speedBtn.addEventListener('click', () => {
-        // Increase speed: 1.0x -> 1.25x -> 1.5x -> 1.75x -> 2.0x -> 1.0x (cycle)
-        const currentRate = ttsManager.rate;
-        let newRate;
-        if (currentRate < 1.25) {
-          newRate = 1.25;
-        } else if (currentRate < 1.5) {
-          newRate = 1.5;
-        } else if (currentRate < 1.75) {
-          newRate = 1.75;
-        } else if (currentRate < 2.0) {
-          newRate = 2.0;
-        } else {
-          newRate = 1.0; // Cycle back to normal
-        }
-        ttsManager.setSpeed(newRate);
-        announce(`Voice speed ${(newRate * 100).toFixed(0)}%`);
-      });
-    }
+    // Speed control button: 1.0x -> 1.25x -> 1.5x -> 1.75x -> 2.0x -> 1.0x (cycle)
+    panel.querySelector('.ir-speed-btn').addEventListener('click', () => {
+      const newRate = [1.25, 1.5, 1.75, 2.0].find(rate => ttsManager.rate < rate) || 1.0;
+      ttsManager.setSpeed(newRate);
+      announce(`Voice speed ${(newRate * 100).toFixed(0)}%`);
+    });
     
     // Initialize speed indicator
     updateSpeedIndicator(ttsManager.rate);
     
     // Detail speak button
-    const detailSpeakBtn = panel.querySelector('.ir-detail-speak');
-    if (detailSpeakBtn) {
-      detailSpeakBtn.addEventListener('click', () => {
-        if (selectedItem) {
-          const displayDesc = selectedItem.description;
-          ttsManager.speak(displayDesc, { interrupt: true, debounceMs: 0 });
-        }
-      });
-    }
-    
-    // Lens navigation
-    const lensPrev = panel.querySelector('.ir-lens-prev');
-    const lensNext = panel.querySelector('.ir-lens-next');
-    if (lensPrev) lensPrev.addEventListener('click', () => navigateLens('left'));
-    if (lensNext) lensNext.addEventListener('click', () => navigateLens('right'));
-    
-    // Item clicks
-    const itemsList = panel.querySelector('.ir-items-list');
-    if (itemsList) {
-      itemsList.addEventListener('click', (e) => {
-      const btn = e.target.closest('.ir-item');
-      if (btn) {
-        const index = parseInt(btn.dataset.index);
-          const currentLensObj = panel.imageData?.lenses?.find(l => l.id === currentLens);
-          const items = isDrilledDown && drillDownStack.length > 0
-            ? drillDownStack[drillDownStack.length - 1].item.subItems || []
-            : currentLensObj?.items || [];
-        focusedIndex = index;
-        selectItem(items[index]);
+    panel.querySelector('.ir-detail-speak').addEventListener('click', () => {
+      if (selectedItem) {
+        ttsManager.speak(selectedItem.description, { interrupt: true, debounceMs: 0 });
       }
     });
-    }
+    
+    // Lens navigation
+    panel.querySelector('.ir-lens-prev').addEventListener('click', () => navigateLens('left'));
+    panel.querySelector('.ir-lens-next').addEventListener('click', () => navigateLens('right'));
+    
+    // Item clicks
+    panel.querySelector('.ir-items-list').addEventListener('click', (e) => {
+      const btn = e.target.closest('.ir-item');
+      if (!btn) return;
+      focusedIndex = parseInt(btn.dataset.index);
+      selectItem(getVisibleItems()[focusedIndex]);
+    });
     
     // Keyboard navigation
     document.addEventListener('keydown', handleKeyDown);
@@ -1633,11 +1426,7 @@
   function handleKeyDown(e) {
     if (!rotorPanel) return;
     
-    // Get current items from lenses array (or the sub-items being viewed)
-    const currentLensObj = rotorPanel.imageData?.lenses?.find(l => l.id === currentLens);
-    const items = isDrilledDown && drillDownStack.length > 0
-      ? drillDownStack[drillDownStack.length - 1].item.subItems || []
-      : currentLensObj?.items || [];
+    const items = getVisibleItems();
 
     // R toggles rotor focus
     if (e.key.toLowerCase() === 'r' && !e.ctrlKey && !e.metaKey && !e.altKey) {
@@ -1651,21 +1440,14 @@
         }
         // Speak lens label once as context anchor
         if (lastLensSpoken !== currentLens) {
-          const lensAnnouncement = currentLensObj?.loading ? `${lensName}, loading` : `${lensName}`;
+          const lensAnnouncement = getCurrentLens()?.loading ? `${lensName}, loading` : `${lensName}`;
           announce(lensAnnouncement);
           ttsManager.speak(lensAnnouncement, { interrupt: true, debounceMs: 0 });
           lastLensSpoken = currentLens;
         }
         // Speak first item label only after lens announcement
         setTimeout(() => {
-          if (items.length > 0 && items[0]) {
-            let labelToSpeak = items[0].label;
-            if ((items[0].confidence === 'low' || items[0].confidence === 'medium') && !labelToSpeak.includes('(likely)')) {
-              labelToSpeak = `${labelToSpeak}. Likely inferred.`;
-            }
-            announce(labelToSpeak);
-            ttsManager.speakDebounced(labelToSpeak);
-          }
+          if (items[0]) speakItemLabel(items[0]);
         }, 800);
       } else {
         announce('Rotor closed');
@@ -1686,111 +1468,47 @@
     
     switch (e.key) {
       case 'ArrowUp':
+      case 'ArrowDown': {
         e.preventDefault();
-        if (items.length > 0) {
-          if (focusedIndex > 0) {
-            focusedIndex = focusedIndex - 1;
-            const item = items[focusedIndex];
-            if (item) {
-              // Navigation = labels only (per requirements)
-              let labelToSpeak = item.label;
-              // Add uncertainty cue only if uncertain
-              if ((item.confidence === 'low' || item.confidence === 'medium') && !labelToSpeak.includes('(likely)')) {
-                labelToSpeak = `${labelToSpeak}. Likely inferred.`;
-              }
-              announce(labelToSpeak);
-              ttsManager.speakDebounced(labelToSpeak);
-            }
-          renderItems();
-          } else {
-            // At first item - play sound to indicate boundary
-            playBoundarySound();
-            announce('First item');
-          }
+        if (items.length === 0) break;
+        const nextIndex = focusedIndex + (e.key === 'ArrowUp' ? -1 : 1);
+        if (nextIndex < 0 || nextIndex >= items.length) {
+          playBoundarySound();
+          announce(e.key === 'ArrowUp' ? 'First item' : 'Last item');
+          break;
         }
+        focusedIndex = nextIndex;
+        speakItemLabel(items[focusedIndex]);
+        renderItems();
         break;
-        
-      case 'ArrowDown':
-        e.preventDefault();
-        if (items.length > 0) {
-          if (focusedIndex < items.length - 1) {
-            focusedIndex = focusedIndex + 1;
-            const item = items[focusedIndex];
-            if (item) {
-              // Navigation = labels only (per requirements)
-              let labelToSpeak = item.label;
-              // Add uncertainty cue only if uncertain
-              if ((item.confidence === 'low' || item.confidence === 'medium') && !labelToSpeak.includes('(likely)')) {
-                labelToSpeak = `${labelToSpeak}. Likely inferred.`;
-              }
-              announce(labelToSpeak);
-              ttsManager.speakDebounced(labelToSpeak);
-            }
-          renderItems();
-          } else {
-            // At last item - play sound to indicate boundary
-            playBoundarySound();
-            announce('Last item');
-          }
-        }
-        break;
+      }
         
       case 'ArrowLeft':
-        e.preventDefault();
-        navigateLens('left');
-        // Speak first item label only after lens name finishes (no focusSummary)
-        setTimeout(() => {
-          const newLensObj = rotorPanel.imageData?.lenses?.find(l => l.id === currentLens);
-          const newItems = newLensObj?.items || [];
-          if (newItems.length > 0 && newItems[0]) {
-            let labelToSpeak = newItems[0].label;
-            if ((newItems[0].confidence === 'low' || newItems[0].confidence === 'medium') && !labelToSpeak.includes('(likely)')) {
-              labelToSpeak = `${labelToSpeak}. Likely inferred.`;
-            }
-            announce(labelToSpeak);
-            ttsManager.speakDebounced(labelToSpeak);
-          }
-        }, 800);
-        break;
-        
       case 'ArrowRight':
         e.preventDefault();
-        navigateLens('right');
+        navigateLens(e.key === 'ArrowLeft' ? 'left' : 'right');
         // Speak first item label only after lens name finishes (no focusSummary)
         setTimeout(() => {
-          const newLensObj = rotorPanel.imageData?.lenses?.find(l => l.id === currentLens);
-          const newItems = newLensObj?.items || [];
-          if (newItems.length > 0 && newItems[0]) {
-            let labelToSpeak = newItems[0].label;
-            if ((newItems[0].confidence === 'low' || newItems[0].confidence === 'medium') && !labelToSpeak.includes('(likely)')) {
-              labelToSpeak = `${labelToSpeak}. Likely inferred.`;
-            }
-            announce(labelToSpeak);
-            ttsManager.speakDebounced(labelToSpeak);
-          }
+          const firstItem = getCurrentLens()?.items[0];
+          if (firstItem) speakItemLabel(firstItem);
         }, 800);
         break;
         
-      case 'Enter':
+      case 'Enter': {
         e.preventDefault();
         const currentItem = items[focusedIndex];
-        if (selectedItem && selectedItem.id === currentItem?.id && !isDrilledDown) {
+        if (!selectedItem || selectedItem.id !== currentItem?.id || isDrilledDown) {
+          selectItem(currentItem);
+        } else if (currentItem.subItems?.length > 0) {
           // Item already selected and has sub-items - drill down
-          if (currentItem.subItems && currentItem.subItems.length > 0) {
-            drillDown(currentItem);
-          } else {
-            // No sub-items, re-read description
-            ttsManager.speak(selectedItem.description, { interrupt: true, debounceMs: 0 });
-            announce(selectedItem.description);
-          }
-        } else if (isDrilledDown) {
-          // In drill-down mode, select sub-item
-          selectItem(currentItem);
+          drillDown(currentItem);
         } else {
-          // Select item
-          selectItem(currentItem);
+          // No sub-items, re-read description
+          ttsManager.speak(selectedItem.description, { interrupt: true, debounceMs: 0 });
+          announce(selectedItem.description);
         }
         break;
+      }
         
       case 'Backspace':
         if (isDrilledDown) {
@@ -1872,43 +1590,39 @@
     if (!isSelectingImage) return;
     
     const img = e.target.closest('img');
-    if (img) {
-      e.preventDefault();
-      e.stopPropagation();
-      removeImageSelector();
-      createRotorPanel(img);
-    }
+    if (!img) return;
+    e.preventDefault();
+    e.stopPropagation();
+    removeImageSelector();
+    createRotorPanel(img);
   }
 
   function handleImageHover(e) {
     if (!isSelectingImage) return;
     
     const img = e.target.closest('img');
-    if (img) {
-      let highlight = document.querySelector('.ir-image-highlight');
-      if (!highlight) {
-        highlight = document.createElement('div');
-        highlight.className = 'ir-image-highlight';
-        document.body.appendChild(highlight);
-      }
-      
-      const rect = img.getBoundingClientRect();
-      highlight.style.top = `${rect.top + window.scrollY}px`;
-      highlight.style.left = `${rect.left + window.scrollX}px`;
-      highlight.style.width = `${rect.width}px`;
-      highlight.style.height = `${rect.height}px`;
-      highlight.style.display = 'block';
+    if (!img) return;
+    let highlight = document.querySelector('.ir-image-highlight');
+    if (!highlight) {
+      highlight = document.createElement('div');
+      highlight.className = 'ir-image-highlight';
+      document.body.appendChild(highlight);
     }
+    
+    const rect = img.getBoundingClientRect();
+    highlight.style.top = `${rect.top + window.scrollY}px`;
+    highlight.style.left = `${rect.left + window.scrollX}px`;
+    highlight.style.width = `${rect.width}px`;
+    highlight.style.height = `${rect.height}px`;
+    highlight.style.display = 'block';
   }
 
   function handleImageUnhover(e) {
     if (!isSelectingImage) return;
     
-    const img = e.target.closest('img');
-    if (img) {
-      const highlight = document.querySelector('.ir-image-highlight');
-      if (highlight) highlight.style.display = 'none';
-    }
+    if (!e.target.closest('img')) return;
+    const highlight = document.querySelector('.ir-image-highlight');
+    if (highlight) highlight.style.display = 'none';
   }
 
   function handleSelectorKeydown(e) {
@@ -1935,16 +1649,12 @@
         break;
         
       case 'increaseVoiceSpeed':
-        if (ttsManager) {
-          ttsManager.increaseSpeed();
-        }
+        ttsManager.increaseSpeed();
         sendResponse({ success: true });
         break;
         
       case 'decreaseVoiceSpeed':
-        if (ttsManager) {
-          ttsManager.decreaseSpeed();
-        }
+        ttsManager.decreaseSpeed();
         sendResponse({ success: true });
         break;
         
@@ -1977,23 +1687,13 @@
             });
           }
           
-          if (img) {
-            console.log('[Image Rotor] Found image element in DOM, creating panel');
-            createRotorPanel(img);
-            sendResponse({ success: true });
-          } else {
+          if (!img) {
+            // Not in the DOM: use a virtual image so the server fetches the URL directly
             console.log('[Image Rotor] Image not found in DOM, creating virtual image object');
-            // Create a virtual image object that just has the URL
-            // We'll use the URL directly in the API call (no base64 conversion)
-            const virtualImg = {
-              src: message.imageUrl,
-              alt: message.altText || '',
-              // Mark it as not in DOM so we skip base64 conversion
-              isVirtual: true
-            };
-            createRotorPanel(virtualImg);
-            sendResponse({ success: true });
+            img = { src: message.imageUrl, alt: message.altText || '', isVirtual: true };
           }
+          createRotorPanel(img);
+          sendResponse({ success: true });
         break;
           
         default:
